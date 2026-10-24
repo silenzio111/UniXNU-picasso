@@ -16,6 +16,7 @@ Supported input methods:
 import argparse
 import binascii
 import os
+import pathlib
 import re
 import struct
 import subprocess
@@ -100,7 +101,7 @@ def parse_embedded_panic_header(data: bytes, offset: int = 0) -> Optional[dict]:
             eph_x86,
         ) = struct.unpack_from("<IIIQIIIIIIQ", data, offset)
 
-        str_base = offset + 48
+        str_base = offset + struct.calcsize("<IIIQIIIIIIQ")
         os_version = ""
         macos_version = ""
         boot_uuid = ""
@@ -227,6 +228,15 @@ def run_cmd(cmd: list) -> Tuple[int, str, str]:
         return -1, "", str(e)
 
 
+
+def run_cmd_bytes(cmd: list) -> Tuple[int, bytes, str]:
+    """Run a command and return stdout as raw bytes (binary-safe, for memory dumps)."""
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        return res.returncode, res.stdout, res.stderr.decode("utf-8", errors="replace")
+    except Exception as e:
+        return -1, b"", str(e)
+
 def extract_fastboot_ramdump(out_path: str, paddr: int, size: int) -> bool:
     """Attempt USB fastboot memory dump via OEM extension commands."""
     print("Checking USB fastboot device...")
@@ -269,10 +279,10 @@ def extract_adb_ramdump(out_path: str, paddr: int, size: int) -> bool:
     skip_mb = paddr // (1024 * 1024)
     count_mb = max(1, size // (1024 * 1024))
     dd_cmd = f"dd if=/dev/mem bs=1M skip={skip_mb} count={count_mb} 2>/dev/null"
-    rc, out, err = run_cmd(["adb", "shell", f"su -c '{dd_cmd}' || {dd_cmd}"])
-    if rc == 0 and len(out.encode("latin1")) > 1024:
+    rc, out, err = run_cmd_bytes(["adb", "exec-out", f"su -c '{dd_cmd}' || {dd_cmd}"])
+    if rc == 0 and len(out) > 1024:
         with open(out_path, "wb") as f:
-            f.write(out.encode("latin1"))
+            f.write(out)
         print(f"Extracted {os.path.getsize(out_path)} bytes via /dev/mem.")
         return True
 
@@ -337,6 +347,34 @@ def print_panic_report(report: dict, verbose: bool = False):
     print("=" * 80)
 
 
+
+
+PICASSO_RING_PADDR = 0xB8000000
+PICASSO_RING_MAGIC  = 0x504F4C47  # 'PLOG'
+
+
+def parse_picasso_ring(data: bytes) -> None:
+    """Parse the picasso persistent console ring: 32-byte header + 1 MiB wrapping data."""
+    if len(data) < 32 + 16:
+        print("Ring extract too short.")
+        return
+    magic, version, generation, data_size, write_total = struct.unpack_from("<IIIIQ", data, 0)
+    if magic != PICASSO_RING_MAGIC:
+        print(f"No PLOG magic at ring base (found {magic:#x}).")
+        return
+    print(f"PLOG version={version} generation={generation} data_size={data_size} write_total={write_total}")
+    buf = data[32:32 + data_size]
+    if len(buf) < data_size:
+        print("Truncated ring data.")
+    have = min(write_total, data_size)
+    tail = bytes(buf[(write_total - i) % data_size] for i in range(have, 0, -1))
+    text = "".join(chr(b) if 32 <= b < 127 or b in (10, 13, 9) else "." for b in tail)
+    out = pathlib.Path("picasso-ring.log")
+    out.write_text(text)
+    print(f"Wrote {len(text)} bytes to {out.resolve()}")
+    print("---- last 2048 bytes ----")
+    print(text[-2048:])
+
 def main():
     parser = argparse.ArgumentParser(
         description="Extract and parse Darwin / iOS panic buffer across warm reboot on Redmi K30 5G (SM7250 / picasso)."
@@ -349,12 +387,23 @@ def main():
     parser.add_argument("--size", type=lambda x: int(x, 0), default=DEFAULT_PRAM_SIZE, help=f"Size of pram buffer in bytes (default: 0x{DEFAULT_PRAM_SIZE:X}).")
     parser.add_argument("--output", "-o", default="picasso-panic.bin", help="Destination file for extracted binary buffer.")
     parser.add_argument("--save-stackshot", help="Path to write raw stackshot data if present.")
+    parser.add_argument("--ring", action="store_true", help="Parse the picasso persistent console ring (PLOG) instead of the panic header.")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose diagnostic output.")
 
     args = parser.parse_args()
 
     data = None
     source_desc = ""
+
+    if args.ring:
+        if not args.file:
+            args.paddr = PICASSO_RING_PADDR
+            args.size = 0x100020
+            if extract_adb_ramdump(args.output, args.paddr, args.size):
+                args.file = args.output
+        if args.file:
+            parse_picasso_ring(open(args.file, "rb").read())
+        return
 
     if args.file:
         source_desc = f"File '{args.file}'"

@@ -125,3 +125,126 @@ index 0000000..3333333
 + 
 + 	/* Check if a shared memory console is running in the panic buffer */
 + 	if (panic_info->eph_magic == 'SHMC') {
+diff --git a/patches/xnu/zzz-picasso-console-ring.patch b/patches/xnu/zzz-picasso-console-ring.patch
+new file mode 100644
+index 0000000..1111113
+--- /dev/null
++++ b/patches/xnu/zzz-picasso-console-ring.patch
+@@ -0,0 +1,117 @@
++--- a/osfmk/console/serial_console.c
+++++ b/osfmk/console/serial_console.c
++@@ -248,9 +248,101 @@
++  * @param poll Whether or not this call should poll instead of going to sleep
++  *             waiting for an interrupt when the hardware device isn't ready
++  */
+++/* picasso persistent console ring: mirror every console character to reserved
+++ * physical RAM that survives warm reboots, so the previous boot's log can be
+++ * extracted from a subsequent environment without a serial port. The buffer is
+++ * at 0xB8000000, outside the 1 MiB panic region at 0xB7F00000 (which pe_init
+++ * clears on every boot) and inside the firmware's Boot Ramdisk Gap. Layout:
+++ * 32-byte header, then 1 MiB of wrapping data. On init the tail of the
+++ * previous session is replayed to the console, which pe_init does not do for
+++ * the panic region: a photograph of the top of the next boot's screen carries
+++ * the end of the last boot's log.
+++ */
+++#define PICASSO_RING_PA         0xB8000000ULL
+++#define PICASSO_RING_DATA_SZ    0x100000ULL
+++#define PICASSO_RING_MAGIC      0x504F4C47u /* "PLOG" */
+++#define PICASSO_RING_REPLAY_SZ  4096u
+++
+++struct picasso_ring_header {
+++	volatile uint32_t magic;
+++	volatile uint32_t version;
+++	volatile uint32_t generation;
+++	volatile uint32_t data_size;
+++	volatile uint64_t write_total; /* monotonically increasing byte count */
+++};
+++
+++static struct picasso_ring_header *picasso_ring_header;
+++static char *picasso_ring_data;
+++static bool picasso_ring_ready;
+++
+++void picasso_console_ring_init(void);
+++
+++void
+++picasso_console_ring_init(void)
+++{
+++	extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+++	vm_offset_t base;
+++	uint32_t previous_generation = 0;
+++	uint64_t previous_total = 0;
+++	bool replay = false;
+++
+++	if (picasso_ring_ready) {
+++		return;
+++	}
+++	base = ml_io_map_wcomb(PICASSO_RING_PA,
+++	    sizeof(*picasso_ring_header) + PICASSO_RING_DATA_SZ);
+++	if (!base) {
+++		return;
+++	}
+++	picasso_ring_header = (struct picasso_ring_header *)base;
+++	picasso_ring_data = (char *)(base + sizeof(*picasso_ring_header));
+++	if (picasso_ring_header->magic == PICASSO_RING_MAGIC &&
+++	    picasso_ring_header->version == 1 &&
+++	    picasso_ring_header->data_size == PICASSO_RING_DATA_SZ) {
+++		previous_generation = picasso_ring_header->generation;
+++		previous_total = picasso_ring_header->write_total;
+++		replay = previous_generation > 0 && previous_total > 0;
+++	} else {
+++		picasso_ring_header->magic = PICASSO_RING_MAGIC;
+++		picasso_ring_header->version = 1;
+++		picasso_ring_header->data_size = PICASSO_RING_DATA_SZ;
+++		picasso_ring_header->write_total = 0;
+++	}
+++	picasso_ring_header->generation = previous_generation + 1;
+++	picasso_ring_ready = true;
+++	if (replay) {
+++		/* The data area is not cleared, so the previous session is still
+++		 * there; print its tail through the normal console so it reaches
+++		 * screen, serial and this ring (as the new session's opening). */
+++		uint64_t have = previous_total < PICASSO_RING_DATA_SZ ?
+++		    previous_total : PICASSO_RING_DATA_SZ;
+++		uint64_t take = have < PICASSO_RING_REPLAY_SZ ? have : PICASSO_RING_REPLAY_SZ;
+++		uint64_t end = previous_total;
+++		printf("\n=== picasso previous session tail (gen %u, %llu bytes total) ===\n",
+++		    previous_generation, previous_total);
+++		for (uint64_t i = take; i > 0; i--) {
+++			char c = picasso_ring_data[(end - i) % PICASSO_RING_DATA_SZ];
+++			printf("%c", (c >= 32 && c < 127) || c == '\n' ? c : '.');
+++		}
+++		printf("\n=== picasso end of previous session ===\n");
+++	}
+++}
+++
+++static inline void
+++picasso_ring_putc(char c)
+++{
+++	if (!picasso_ring_ready) {
+++		return;
+++	}
+++	uint64_t total = picasso_ring_header->write_total;
+++	picasso_ring_data[total % PICASSO_RING_DATA_SZ] = c;
+++	picasso_ring_header->write_total = total + 1;
+++}
+++
++ static inline void
++ _cnputc(char c, bool poll)
++ {
+++	picasso_ring_putc(c);
++ 	bool in_debugger = (kernel_debugger_entry_count > 0);
++ 	const uint32_t idx = get_cons_ops_index();
++ 
++--- a/pexpert/arm/pe_init.c
+++++ b/pexpert/arm/pe_init.c
++@@ -192,6 +192,10 @@
++ PE_initialize_console(PE_Video * info, int op)
++ {
++ 	static int last_console = -1;
+++	{
+++		extern void picasso_console_ring_init(void);
+++		picasso_console_ring_init();
+++	}
++ 
++ 	if (info && (info != &PE_state.video)) {
++ 		info->v_scale = PE_state.video.v_scale;
