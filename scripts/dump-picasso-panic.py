@@ -349,7 +349,7 @@ def print_panic_report(report: dict, verbose: bool = False):
 
 
 
-PICASSO_RING_PADDR = 0xB8000000
+PICASSO_RING_PADDR = 0x100000000  # 4 GiB mark, above the 2 GiB the ADT declares; untouched by ABL/UEFI/XNU
 PICASSO_RING_MAGIC  = 0x504F4C47  # 'PLOG'
 
 

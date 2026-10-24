@@ -140,14 +140,14 @@ index 0000000..1111116
 ++/* picasso persistent console ring: mirror every console character to reserved
 ++ * physical RAM that survives warm reboots, so the previous boot's log can be
 ++ * extracted from a subsequent environment without a serial port. The buffer is
-++ * at 0xB8000000, outside the 1 MiB panic region at 0xB7F00000 (which pe_init
-++ * clears on every boot) and inside the firmware's Boot Ramdisk Gap. Layout:
+++ * at the 4 GiB mark (0x100000000), above the 2 GiB the ADT declares, so ABL, UEFI and
+++ * XNU never allocate it; the Boot Ramdisk Gap the panic region sits in is a UEFI free pool.
 ++ * 32-byte header, then 1 MiB of wrapping data. On init the tail of the
 ++ * previous session is replayed to the console, which pe_init does not do for
 ++ * the panic region: a photograph of the top of the next boot's screen carries
 ++ * the end of the last boot's log.
 ++ */
-++#define PICASSO_RING_PA         0xB8000000ULL
+++#define PICASSO_RING_PA         0x100000000ULL
 ++#define PICASSO_RING_DATA_SZ    0x100000ULL
 ++#define PICASSO_RING_MAGIC      0x504F4C47u /* "PLOG" */
 ++#define PICASSO_RING_REPLAY_SZ  2048u
