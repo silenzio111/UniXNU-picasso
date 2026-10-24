@@ -127,25 +127,24 @@ index 0000000..3333333
 + 	if (panic_info->eph_magic == 'SHMC') {
 diff --git a/patches/xnu/zzz-picasso-console-ring.patch b/patches/xnu/zzz-picasso-console-ring.patch
 new file mode 100644
-index 0000000..1111113
+index 0000000..1111115
 --- /dev/null
 +++ b/patches/xnu/zzz-picasso-console-ring.patch
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,133 @@
 +--- a/osfmk/console/serial_console.c
 ++++ b/osfmk/console/serial_console.c
-+@@ -248,9 +248,101 @@
-+  * @param poll Whether or not this call should poll instead of going to sleep
-+  *             waiting for an interrupt when the hardware device isn't ready
++@@ -523,8 +523,109 @@
++  * @param size The number of characters in `str` to print.
 +  */
-++/* picasso persistent console ring: mirror every console character to reserved
-++ * physical RAM that survives warm reboots, so the previous boot's log can be
-++ * extracted from a subsequent environment without a serial port. The buffer is
-++ * at 0xB8000000, outside the 1 MiB panic region at 0xB7F00000 (which pe_init
-++ * clears on every boot) and inside the firmware's Boot Ramdisk Gap. Layout:
-++ * 32-byte header, then 1 MiB of wrapping data. On init the tail of the
-++ * previous session is replayed to the console, which pe_init does not do for
-++ * the panic region: a photograph of the top of the next boot's screen carries
-++ * the end of the last boot's log.
++ void
+++/* picasso persistent console ring: mirror console output to reserved physical
+++ * RAM that survives warm reboots, so the previous boot's log can be read after
+++ * a restart without a serial port. The buffer is at 0xB8000000, outside the
+++ * 1 MiB panic region at 0xB7F00000 (which pe_init clears on every boot) and
+++ * inside the firmware's Boot Ramdisk Gap. Layout: 32-byte header, then 1 MiB
+++ * of wrapping data. On init the previous session's tail is replayed to the
+++ * console. Hooks live at console_write/console_write_unbuffered entry, away
+++ * from zzz-boot-progress territory (_cnputc and the file head).
 ++ */
 ++#define PICASSO_RING_PA         0xB8000000ULL
 ++#define PICASSO_RING_DATA_SZ    0x100000ULL
@@ -200,9 +199,6 @@ index 0000000..1111113
 ++	picasso_ring_header->generation = previous_generation + 1;
 ++	picasso_ring_ready = true;
 ++	if (replay) {
-++		/* The data area is not cleared, so the previous session is still
-++		 * there; print its tail through the normal console so it reaches
-++		 * screen, serial and this ring (as the new session's opening). */
 ++		uint64_t have = previous_total < PICASSO_RING_DATA_SZ ?
 ++		    previous_total : PICASSO_RING_DATA_SZ;
 ++		uint64_t take = have < PICASSO_RING_REPLAY_SZ ? have : PICASSO_RING_REPLAY_SZ;
@@ -228,16 +224,36 @@ index 0000000..1111113
 ++	picasso_ring_header->write_total = total + 1;
 ++}
 ++
-+ static inline void
-+ _cnputc(char c, bool poll)
+++static inline void
+++picasso_ring_puts(const char *str, int size)
+++{
+++	int index;
+++
+++	if (!picasso_ring_ready) {
+++		return;
+++	}
+++	for (index = 0; index < size; index++) {
+++		picasso_ring_putc(str[index]);
+++	}
+++}
+++
++ console_write(char *str, int size)
 + {
+++	picasso_ring_puts(str, size);
++ 	if (disableConsoleOutput) {
++ 		return;
++ 	}
++@@ -613,6 +714,7 @@
++ 	if (disableConsoleOutput) {
++ 		return;
++ 	}
 ++	picasso_ring_putc(c);
-+ 	bool in_debugger = (kernel_debugger_entry_count > 0);
-+ 	const uint32_t idx = get_cons_ops_index();
 + 
++ 	_cnputc(c, true);
++ }
 +--- a/pexpert/arm/pe_init.c
 ++++ b/pexpert/arm/pe_init.c
-+@@ -192,6 +192,10 @@
++@@ -210,6 +210,10 @@
 + PE_initialize_console(PE_Video * info, int op)
 + {
 + 	static int last_console = -1;
