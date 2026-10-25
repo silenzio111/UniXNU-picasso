@@ -1,0 +1,1508 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 19b4065..b22147f 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -107,6 +107,7 @@ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/mem.c				standard
++bsd/dev/picasso_usb.c			standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+ 
+diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
+new file mode 100644
+index 0000000..e00508f
+--- /dev/null
++++ b/bsd/dev/picasso_usb.c
+@@ -0,0 +1,1458 @@
++/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
++ *
++ * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
++ * kernel. Log output only: the console mirror ring is streamed on the bulk IN
++ * endpoint; there is no command processing or RX data path.
++ *
++ * Hardware notes (SM7250): the USB controller is a Synopsys DWC3 at
++ * 0x0a600000 behind Qualcomm's dwc-usb3-msm wrapper (QSCRATCH at +0xf8800),
++ * the same IP generation as SM8550/SM8650 whose constants vermeer validated.
++ * The controller is only touched when GCC reports the USB30_PRIM power
++ * domain on; the soft reset is bounded. The wrapper is told to use UTMI as
++ * the PIPE clock because Picasso has no enabled SuperSpeed PHY, but no clock
++ * rate or PHY power state is changed here. ABL/UEFI leave the controller
++ * powered from the fastboot session. Boot-arg picasso_usb=1 probes state
++ * only, 2 also runs the console.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <machine/atomic.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern uint64_t kvtophys(vm_offset_t va);
++extern void console_write_unbuffered(char);
++
++/* ------------------------------------------------------------------ */
++/* Console mirror ring: any context, best effort, never waits.        */
++
++#define PURing_SIZE   (256 * 1024)
++#define PURing_MASK   (PURing_SIZE - 1)
++
++static struct {
++	char        buffer[PURing_SIZE];
++	uint64_t    total;
++} pur_ring;
++static uint32_t _Atomic pur_lock;
++static uint64_t _Atomic pur_dropped;
++static bool pur_live;                   /* set once the TX thread streams */
++
++void picasso_usb_log_char(char c);
++static void picasso_usb_console_drive_poll(void);
++
++void
++picasso_usb_log_char(char c)
++{
++	if (!os_atomic_cmpxchg(&pur_lock, 0, 1, acquire)) {
++		os_atomic_add(&pur_dropped, 1, relaxed);
++		return;
++	}
++	pur_ring.buffer[pur_ring.total & PURing_MASK] = c;
++	pur_ring.total++;
++	os_atomic_store(&pur_lock, 0, release);
++	/*
++	 * bsd_init still runs before early kernel threads reliably receive CPU.
++	 * Drive the DWC3 event ring from console output itself until the
++	 * background poller becomes schedulable.
++	 */
++	picasso_usb_console_drive_poll();
++}
++
++static uint32_t
++pur_copy(uint64_t *pos, char *out, uint32_t max)
++{
++	uint32_t n = 0;
++	if (!os_atomic_cmpxchg(&pur_lock, 0, 1, acquire)) {
++		return 0;
++	}
++	if (pur_ring.total - *pos > PURing_SIZE) {
++		*pos = pur_ring.total - PURing_SIZE;
++	}
++	n = (uint32_t)MIN((uint64_t)max, pur_ring.total - *pos);
++	for (uint32_t i = 0; i < n; i++) {
++		out[i] = pur_ring.buffer[(*pos + i) & PURing_MASK];
++	}
++	*pos += n;
++	os_atomic_store(&pur_lock, 0, release);
++	return n;
++}
++
++/* ------------------------------------------------------------------ */
++/* DWC3 device mode, EP0 + one bulk IN pair. Register layout follows   */
++/* the Synopsys databook as used by Linux drivers/usb/dwc3.           */
++
++#define GCC_PA                  0x00100000u
++#define GCC_SIZE                0x00090000u
++#define GCC_USB30_PRIM_GDSCR    0x0f004u         /* bit 31: power on */
++#define GCC_USB30_PRIM_MASTER   0x0f010u
++#define GCC_USB30_PRIM_SLEEP    0x0f018u
++#define GCC_USB30_PRIM_MOCK_UTMI 0x0f01cu
++#define GCC_CFG_NOC_USB3_PRIM   0x0f07cu
++#define GCC_AGGRE_USB3_PRIM     0x0f080u
++#define GCC_USB3_PRIM_CLKREF    0x8c010u
++
++#define SMMU_PA                 0x15000000u
++#define SMMU_SIZE               0x000d0000u
++#define USB_STREAM_ID           0x00e0u
++
++#define DWC3_PA                 0x0a600000u
++#define DWC3_SIZE               0x00100000u
++#define QSCRATCH_OFFSET         0x000f8800u
++#define QSCRATCH_PA             (DWC3_PA + QSCRATCH_OFFSET)
++#define QSCRATCH_GENERAL_CFG    0x08u
++#define   PIPE_UTMI_CLK_SEL     (1u << 0)
++#define   PIPE3_PHYSTATUS_SW    (1u << 3)
++#define   PIPE_UTMI_CLK_DIS     (1u << 8)
++#define QSCRATCH_HS_PHY_CTRL    0x10u
++#define   UTMI_OTG_VBUS_VALID   (1u << 20)
++#define   SW_SESSVLD_SEL        (1u << 28)
++#define QSCRATCH_CGCTL          0x28u
++#define QSCRATCH_SS_PHY_CTRL    0x30u
++#define   LANE0_PWR_PRESENT     (1u << 24)
++#define QSCRATCH_PWR_EVT_STAT   0x58u
++#define QSCRATCH_PWR_EVT_MASK   0x5cu
++
++#define GCTL            0xc110u
++#define GUSB2PHYCFG0    0xc200u
++#define GUSB3PIPECTL0   0xc2c0u
++#define GEVNTADRLO      0xc400u
++#define GEVNTADRHI      0xc404u
++#define GEVNTSIZ        0xc408u
++#define GEVNTCOUNT      0xc40cu
++#define DCFG            0xc700u
++#define DCTL            0xc704u
++#define DEVTEN          0xc708u
++#define DSTS            0xc70cu
++#define DALEPENA        0xc720u
++#define DEPCMDPAR2(n)   (0xc800u + 0x10u * (n))
++#define DEPCMDPAR1(n)   (0xc804u + 0x10u * (n))
++#define DEPCMDPAR0(n)   (0xc808u + 0x10u * (n))
++#define DEPCMD(n)       (0xc80cu + 0x10u * (n))
++
++#define DCTL_RUN_STOP   (1u << 31)
++#define DCTL_CSFTRST    (1u << 30)
++#define DSTS_DEVCTRLHLT (1u << 22)
++#define GUSB2PHYCFG_SUSPHY   (1u << 6)
++#define GUSB2PHYCFG_ENBLSLPM (1u << 8)
++#define GUSB3PIPECTL_SUSPHY  (1u << 17)
++
++#define DEPCMD_SETEPCONFIG      1u
++#define DEPCMD_SETTRANSFRESOURCE 2u
++#define DEPCMD_SETSTALL         4u
++#define DEPCMD_STARTTRANSFER    6u
++#define DEPCMD_DEPSTARTCFG      9u
++#define DEPCMD_CMDACT           (1u << 10)
++
++#define TRB_HWO         (1u << 0)
++#define TRB_LST         (1u << 1)
++#define TRB_ISP_IMI     (1u << 10)
++#define TRB_IOC         (1u << 11)
++#define TRBCTL_NORMAL   (1u << 4)
++#define TRBCTL_SETUP    (2u << 4)
++#define TRBCTL_STATUS2  (3u << 4)
++#define TRBCTL_STATUS3  (4u << 4)
++#define TRBCTL_DATA     (5u << 4)
++
++/* physical endpoints: 0/1 = ep0 OUT/IN, 2 = bulk OUT, 3 = bulk IN */
++#define EP_RX           2u
++#define EP_TX           3u
++#define EP_NOTIFY       5u
++
++/* DMA area layout */
++#define UD_EVT          0x0000u         /* event buffer, 4 KiB */
++#define UD_EVT_SIZE     0x1000u
++#define UD_TRB_OUT      0x1000u         /* ep0 OUT TRB */
++#define UD_TRB_IN       0x1010u         /* ep0 IN TRB */
++#define UD_TRB_TX       0x1030u         /* bulk IN TRB */
++#define UD_TRB_NOTIFY   0x1020u         /* interrupt IN endpoint */
++#define UD_SETUP        0x1040u         /* 8-byte setup packet */
++#define UD_DATA         0x1100u         /* ep0 data stage, 512 bytes */
++#define UD_NOTIFY       0x1800u         /* CDC serial-state notification */
++#define UD_NOTIFY_SIZE  10u
++#define UD_TX           0x2000u         /* bulk IN log chunk, 4 KiB */
++#define UD_TX_SIZE      0x1000u
++#define UD_SIZE         0x4000u
++
++static struct {
++	vm_offset_t dwc;
++	vm_offset_t dma;
++	uint64_t    dma_pa;
++	uint32_t    evt_pos;
++	int         sleep_chan;
++	enum { EP0_SETUP, EP0_DATA, EP0_WAIT_STATUS2, EP0_WAIT_STATUS3, EP0_STATUS } state;
++	bool        data_in;
++	uint8_t     last_request;
++	uint16_t    data_length;
++	bool        configured;
++	bool        tx_busy;
++	bool        notify_busy;
++	bool        trace_commands;
++	bool        smmu_guard;
++	bool        live;
++	bool        hold;
++	bool        host_open;
++	uint32_t _Atomic poll_lock;
++	uint64_t    tx_pos;                  /* ring reader position */
++	uint64_t    events, chars;
++} ud;
++
++static inline uint32_t
++usb_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++usb_wr(vm_offset_t base, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(base + off) = value;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
++ * delay() can block on this early boot path before the scheduler is usable.
++ * Use a bounded ARM yield loop for register settling and polling gaps.
++ */
++static void
++picasso_usb_busy_wait(unsigned usec)
++{
++	while (usec-- != 0) {
++		for (unsigned spin = 0; spin < 4096; spin++) {
++			__asm__ volatile ("yield" ::: "memory");
++		}
++	}
++}
++
++static unsigned
++picasso_smmu_addr_bits(unsigned code)
++{
++	switch (code) {
++	case 0: return 32;
++	case 1: return 36;
++	case 2: return 40;
++	case 3: return 42;
++	case 4: return 44;
++	case 5: return 48;
++	default: return 0;
++	}
++}
++
++static inline void
++picasso_usb_smmu_write(vm_offset_t base, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(base + off) = value;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++picasso_usb_sync_mark(const char *text)
++{
++	while (*text != '\0') {
++		console_write_unbuffered(*text++);
++	}
++	console_write_unbuffered('\n');
++}
++
++static void
++picasso_usb_sync_mark_index(const char *text, unsigned index)
++{
++	char digits[10];
++	unsigned count = 0;
++
++	while (*text != '\0') {
++		console_write_unbuffered(*text++);
++	}
++	do {
++		digits[count++] = (char)('0' + index % 10);
++		index /= 10;
++	} while (index != 0);
++	while (count != 0) {
++		console_write_unbuffered(digits[--count]);
++	}
++	console_write_unbuffered('\n');
++}
++
++static void
++picasso_usb_sync_hex(const char *text, uint32_t value)
++{
++	static const char hex[] = "0123456789abcdef";
++
++	while (*text != '\0') {
++		console_write_unbuffered(*text++);
++	}
++	console_write_unbuffered('0');
++	console_write_unbuffered('x');
++	for (int shift = 28; shift >= 0; shift -= 4) {
++		console_write_unbuffered(hex[(value >> shift) & 0xfu]);
++	}
++	console_write_unbuffered('\n');
++}
++
++/*
++ * Read-only QSCRATCH diagnostics. Each access has a synchronous breadcrumb
++ * before it, so the last visible line identifies a stalled interconnect read.
++ */
++static void
++picasso_usb_qscratch_probe(vm_offset_t qs)
++{
++	picasso_usb_sync_mark("PICASSO USB: QPROBE enter");
++	picasso_usb_busy_wait(1000);
++
++	picasso_usb_sync_mark("PICASSO USB: QPROBE GENERAL_CFG read begin");
++	uint32_t general = usb_rd(qs, QSCRATCH_GENERAL_CFG);
++	picasso_usb_sync_hex("PICASSO USB: QPROBE GENERAL_CFG=", general);
++
++	picasso_usb_sync_mark("PICASSO USB: QPROBE HS_PHY_CTRL read begin");
++	uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL);
++	picasso_usb_sync_hex("PICASSO USB: QPROBE HS_PHY_CTRL=", hs);
++
++	picasso_usb_sync_mark("PICASSO USB: QPROBE SS_PHY_CTRL read begin");
++	uint32_t ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
++	picasso_usb_sync_hex("PICASSO USB: QPROBE SS_PHY_CTRL=", ss);
++
++	picasso_usb_sync_mark("PICASSO USB: QPROBE CGCTL read begin");
++	uint32_t cgctl = usb_rd(qs, QSCRATCH_CGCTL);
++	picasso_usb_sync_hex("PICASSO USB: QPROBE CGCTL=", cgctl);
++
++	picasso_usb_sync_mark("PICASSO USB: QPROBE PWR_EVT_STAT read begin");
++	uint32_t pwr_stat = usb_rd(qs, QSCRATCH_PWR_EVT_STAT);
++	picasso_usb_sync_hex("PICASSO USB: QPROBE PWR_EVT_STAT=", pwr_stat);
++
++	picasso_usb_sync_mark("PICASSO USB: QPROBE PWR_EVT_MASK read begin");
++	uint32_t pwr_mask = usb_rd(qs, QSCRATCH_PWR_EVT_MASK);
++	picasso_usb_sync_hex("PICASSO USB: QPROBE PWR_EVT_MASK=", pwr_mask);
++
++	picasso_usb_sync_mark("PICASSO USB: QPROBE GENERAL_CFG2 read begin");
++	uint32_t general2 = usb_rd(qs, QSCRATCH_GENERAL_CFG);
++	picasso_usb_sync_hex("PICASSO USB: QPROBE GENERAL_CFG2=", general2);
++	picasso_usb_sync_mark("PICASSO USB: QPROBE complete");
++}
++
++/*
++ * Minimal read-only experiment for the SMMU register block. The plan/apply
++ * path stays untouched; synchronous breadcrumbs are emitted immediately
++ * before each read so a bus hang identifies the exact register even when the
++ * buffered console cannot drain.
++ */
++static bool
++picasso_usb_smmu_probe_page(vm_offset_t smmu)
++{
++	picasso_usb_sync_mark("PICASSO USB: PROBE enter");
++	picasso_usb_sync_mark("PICASSO USB: PROBE sCR0 begin");
++	uint32_t scr0 = usb_rd(smmu, 0x000);
++	picasso_usb_sync_mark("PICASSO USB: PROBE sCR0 ok");
++	printf("PICASSO USB: SMMU probe sCR0=%08x\n", scr0);
++
++	picasso_usb_sync_mark("PICASSO USB: PROBE sGFSR begin");
++	uint32_t gfsr = usb_rd(smmu, 0x048);
++	picasso_usb_sync_mark("PICASSO USB: PROBE sGFSR ok");
++	printf("PICASSO USB: SMMU probe sGFSR=%08x\n", gfsr);
++
++	picasso_usb_sync_mark("PICASSO USB: PROBE IDR begin");
++	uint32_t idr0 = usb_rd(smmu, 0x020);
++	uint32_t idr1 = usb_rd(smmu, 0x024);
++	uint32_t idr2 = usb_rd(smmu, 0x028);
++	picasso_usb_sync_mark("PICASSO USB: PROBE IDR ok");
++	printf("PICASSO USB: SMMU probe idr=%08x/%08x/%08x\n",
++	    idr0, idr1, idr2);
++
++	unsigned slots = idr0 & 0xffu;
++	if (!slots || slots > 128) {
++		printf("PICASSO USB: SMMU probe bad stream count=%u\n", slots);
++		return false;
++	}
++
++	unsigned active = 0;
++	unsigned free_slot = 0xffffu;
++	for (unsigned i = 0; i < slots; i++) {
++		picasso_usb_sync_mark_index("PICASSO USB: PROBE SMR begin ",
++		    i);
++		uint32_t smr = usb_rd(smmu, 0x800u + 4u * i);
++		if (smr & (1u << 31)) {
++			active++;
++		} else if (free_slot == 0xffffu) {
++			free_slot = i;
++		}
++	}
++	printf("PICASSO USB: SMMU probe complete active=%u free=%u\n",
++	    active, free_slot);
++	return true;
++}
++
++/*
++ * The Qualcomm firmware implements Linux's SMMU bypass quirk: a TYPE=BYPASS
++ * S2CR reads back as FAULT, while TYPE=TRANSLATE to a disabled
++ * S1_TRANS_S2_BYPASS context bank works. Bind only the USB SID, never change
++ * sCR0, and leave every other stream route untouched. This is explicitly a
++ * debug-boot operation and is lost on the next reset.
++ */
++struct picasso_usb_smmu_bind {
++	unsigned slot;
++	unsigned bank;
++	uint32_t cbar;
++	uint32_t cba2r;
++	uint32_t sctlr;
++	uint32_t sctlr_off;
++};
++
++static bool
++picasso_usb_smmu_plan_bind(vm_offset_t smmu,
++    struct picasso_usb_smmu_bind *plan, bool verbose)
++{
++	if (verbose) {
++		picasso_usb_sync_mark("PICASSO USB: PLAN sCR0 begin");
++	}
++	uint32_t scr0 = usb_rd(smmu, 0x000);
++	if (verbose) {
++		picasso_usb_sync_mark("PICASSO USB: PLAN sGFSR begin");
++	}
++	uint32_t gfsr = usb_rd(smmu, 0x048);
++	if (verbose) {
++		picasso_usb_sync_mark("PICASSO USB: PLAN IDR begin");
++	}
++	uint32_t idr0 = usb_rd(smmu, 0x020);
++	uint32_t idr1 = usb_rd(smmu, 0x024);
++	uint32_t idr2 = usb_rd(smmu, 0x028);
++	unsigned slots = idr0 & 0xffu;
++	unsigned banks = idr1 & 0xffu;
++	unsigned pages = 1u << (((idr1 >> 28) & 7u) + 1u);
++	bool exids = (idr0 & (1u << 8)) != 0;
++	unsigned active = 0, free_slot = 0xffffu;
++	uint8_t bank_users[128] = { 0 };
++	uint32_t smrs[128];
++
++	printf("PICASSO USB: SMMU bind scr0=%08x gfsr=%08x idr=%08x/%08x/%08x exids=%u\n",
++	    scr0, gfsr, idr0, idr1, idr2, exids);
++	if (!slots || slots > 128 || !banks || banks > 128 || pages > 128 ||
++	    (pages + banks) * 4096u > SMMU_SIZE) {
++		printf("PICASSO USB: SMMU bind unsupported geometry\n");
++		return false;
++	}
++	if (exids) {
++		printf("PICASSO USB: SMMU bind refuses EXIDS layout\n");
++		return false;
++	}
++
++	for (unsigned i = 0; i < slots; i++) {
++		if (verbose) {
++			picasso_usb_sync_mark_index(
++			    "PICASSO USB: PLAN SMR begin ", i);
++		} else if ((i & 15u) == 0) {
++			printf("PICASSO USB: SMMU bind scan smr %u/%u\n", i, slots);
++		}
++		smrs[i] = usb_rd(smmu, 0x800u + 4u * i);
++		if (smrs[i] & (1u << 31)) {
++			active++;
++		} else if (free_slot == 0xffffu) {
++			free_slot = i;
++		}
++	}
++	printf("PICASSO USB: SMMU bind smr active=%u free=%u\n",
++	    active, free_slot);
++	if (free_slot == 0xffffu) {
++		printf("PICASSO USB: SMMU bind no free stream-match slot\n");
++		return false;
++	}
++
++	for (unsigned i = 0; i < slots; i++) {
++		if (!(smrs[i] & (1u << 31))) {
++			continue;
++		}
++		if (verbose) {
++			picasso_usb_sync_mark_index(
++			    "PICASSO USB: PLAN S2CR begin ", i);
++		}
++		uint32_t s2cr = usb_rd(smmu, 0xc00u + 4u * i);
++		if (((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) < banks) {
++			bank_users[s2cr & 0xffu]++;
++		}
++	}
++	printf("PICASSO USB: SMMU bind s2cr scan done\n");
++
++	for (unsigned attempt = 0; attempt < banks; attempt++) {
++		unsigned bank = banks - 1 - attempt;
++		if (bank_users[bank]) {
++			printf("PICASSO USB: SMMU bank %u users=%u skip\n",
++			    bank, bank_users[bank]);
++			continue;
++		}
++		if (verbose) {
++			picasso_usb_sync_mark_index(
++			    "PICASSO USB: PLAN bank begin ", bank);
++		}
++		printf("PICASSO USB: SMMU bank %u probe\n", bank);
++		uint32_t cbar = usb_rd(smmu, 0x1000u + 4u * bank);
++		printf("PICASSO USB: SMMU bank %u cbar=%08x\n", bank, cbar);
++		uint32_t cba2r = usb_rd(smmu, 0x1800u + 4u * bank);
++		printf("PICASSO USB: SMMU bank %u cba2r=%08x\n", bank, cba2r);
++		uint32_t sctlr = usb_rd(smmu, (pages + bank) * 4096u);
++		printf("PICASSO USB: SMMU bank %u sctlr=%08x M=%u\n",
++		    bank, sctlr, sctlr & 1u);
++		if ((sctlr & 1u) != 0 ||
++		    (cbar != 0 && cbar != 0x10000u)) {
++			continue;
++		}
++
++		plan->slot = free_slot;
++		plan->bank = bank;
++		plan->cbar = cbar;
++		plan->cba2r = cba2r | 1u;
++		plan->sctlr = sctlr;
++		plan->sctlr_off = (pages + bank) * 4096u;
++		printf("PICASSO USB: SMMU bind plan slot=%u bank=%u\n",
++		    plan->slot, plan->bank);
++		return true;
++	}
++	printf("PICASSO USB: SMMU bind found no disabled bypass bank\n");
++	return false;
++}
++
++static bool
++picasso_usb_smmu_apply_bind(vm_offset_t smmu,
++    const struct picasso_usb_smmu_bind *plan)
++{
++	printf("PICASSO USB: SMMU bind apply slot=%u bank=%u\n",
++	    plan->slot, plan->bank);
++	if (plan->cbar != 0x10000u) {
++		picasso_usb_smmu_write(smmu, 0x1000u + 4u * plan->bank,
++		    0x10000u);
++	}
++	picasso_usb_smmu_write(smmu, 0x1800u + 4u * plan->bank,
++	    plan->cba2r);
++	uint32_t sctlr_after = usb_rd(smmu, plan->sctlr_off);
++	if (usb_rd(smmu, 0x1000u + 4u * plan->bank) != 0x10000u ||
++	    usb_rd(smmu, 0x1800u + 4u * plan->bank) != plan->cba2r ||
++	    sctlr_after != plan->sctlr) {
++		printf("PICASSO USB: SMMU bank %u setup readback FAIL\n",
++		    plan->bank);
++		return false;
++	}
++
++	picasso_usb_smmu_write(smmu, 0xc00u + 4u * plan->slot, plan->bank);
++	if (usb_rd(smmu, 0xc00u + 4u * plan->slot) != plan->bank) {
++		printf("PICASSO USB: SMMU bind S2CR readback FAIL\n");
++		return false;
++	}
++	picasso_usb_smmu_write(smmu, 0x800u + 4u * plan->slot,
++	    0x80000000u | USB_STREAM_ID);
++	uint32_t smr = usb_rd(smmu, 0x800u + 4u * plan->slot);
++	uint32_t s2cr = usb_rd(smmu, 0xc00u + 4u * plan->slot);
++	printf("PICASSO USB: SMMU bind route slot=%u smr=%08x s2cr=%08x bank=%u cbar=%08x cba2r=%08x sctlr=%08x\n",
++	    plan->slot, smr, s2cr, plan->bank, plan->cbar, plan->cba2r,
++	    plan->sctlr);
++	if (smr != (0x80000000u | USB_STREAM_ID) || s2cr != plan->bank) {
++		printf("PICASSO USB: SMMU bind route readback FAIL\n");
++		return false;
++	}
++	return true;
++}
++
++/*
++ * Read-only guard for the apps SMMU. A debug-only DMA path may use an
++ * existing direct/bypass route, but must never create or weaken one.
++ */
++static bool
++picasso_usb_smmu_guard(vm_offset_t smmu, uint64_t dma, uint64_t bytes)
++{
++	uint32_t scr0 = usb_rd(smmu, 0x000);
++	uint32_t idr0 = usb_rd(smmu, 0x020);
++	uint32_t idr1 = usb_rd(smmu, 0x024);
++	uint32_t idr2 = usb_rd(smmu, 0x028);
++	uint32_t gfsr = usb_rd(smmu, 0x048);
++	unsigned count = idr0 & 0xffu;
++	unsigned banks = idr1 & 0xffu;
++	unsigned pages = 1u << (((idr1 >> 28) & 7u) + 1u);
++	unsigned matches = 0;
++	unsigned match_index = 0;
++	uint32_t match_smr = 0;
++	uint32_t match_s2cr = 0;
++	uint32_t match_mask = 0;
++
++	printf("PICASSO USB: SMMU scr0=%08x idr=%08x/%08x/%08x gfsr=%08x\n",
++	    scr0, idr0, idr1, idr2, gfsr);
++	printf("PICASSO USB: SMMU streams=%u banks=%u pages=%u\n",
++	    count, banks, pages);
++	if (!count || !banks || pages > 128 ||
++	    (pages + banks) * 4096u > SMMU_SIZE) {
++		printf("PICASSO USB: SID e0 guard FAIL: unsupported SMMU geometry\n");
++		return false;
++	}
++
++	for (unsigned i = 0; i < count; i++) {
++		uint32_t smr = usb_rd(smmu, 0x800u + 4u * i);
++		if (!(smr & (1u << 31))) {
++			continue;
++		}
++		uint32_t mask = (smr >> 16) & 0x7fffu;
++		if (((smr ^ USB_STREAM_ID) & 0xffffu & ~mask) != 0) {
++			continue;
++		}
++		matches++;
++		if (matches <= 4) {
++			printf("PICASSO USB: SID e0 match %u smr=%08x s2cr=%08x\n",
++			    i, smr, usb_rd(smmu, 0xc00u + 4u * i));
++		}
++		if (matches == 1) {
++			match_index = i;
++			match_smr = smr;
++			match_mask = mask;
++			match_s2cr = usb_rd(smmu, 0xc00u + 4u * i);
++		}
++	}
++	if (matches != 1) {
++		printf("PICASSO USB: SID e0 guard FAIL: matches=%u (need exactly 1)\n",
++		    matches);
++		return false;
++	}
++	if (match_mask != 0) {
++		printf("PICASSO USB: SID e0 guard FAIL: non-exact mask=%04x\n",
++		    match_mask);
++		return false;
++	}
++
++	unsigned type = (match_s2cr >> 16) & 3u;
++	unsigned bank = match_s2cr & 0xffu;
++	uint32_t cbar = 0;
++	uint32_t cba2r = 0;
++	uint32_t sctlr = 0;
++	bool identity = false;
++
++	if (type == 0) {
++		if (bank >= banks) {
++			printf("PICASSO USB: SID e0 guard FAIL: cb=%u banks=%u\n",
++			    bank, banks);
++			return false;
++		}
++		cbar = usb_rd(smmu, 0x1000u + 4u * bank);
++		cba2r = usb_rd(smmu, 0x1800u + 4u * bank);
++		sctlr = usb_rd(smmu, (pages + bank) * 4096u);
++		identity = ((cbar >> 16) & 3u) == 1u && !(sctlr & 1u);
++	} else if (type == 1) {
++		identity = true;
++	}
++	printf("PICASSO USB: SID e0 match=%u smr=%08x s2cr=%08x type=%u cb=%u\n",
++	    match_index, match_smr, match_s2cr, type, bank);
++	printf("PICASSO USB: SID e0 cbar=%08x cba2r=%08x sctlr=%08x path=%s\n",
++	    cbar, cba2r, sctlr, identity ? "identity" : "not-identity");
++	if (!identity) {
++		printf("PICASSO USB: SID e0 guard FAIL: route is not direct identity\n");
++		return false;
++	}
++
++	unsigned in_bits = picasso_smmu_addr_bits(idr2 & 0xf);
++	unsigned out_bits = picasso_smmu_addr_bits((idr2 >> 4) & 0xf);
++	unsigned mid_bits = picasso_smmu_addr_bits((idr2 >> 8) & 0xf);
++	printf("PICASSO USB: SMMU widths in/out/mid=%u/%u/%u DMA=0x%llx+0x%llx\n",
++	    in_bits, out_bits, mid_bits, dma, bytes);
++	if (bytes) {
++		unsigned widths[3] = { in_bits, out_bits, mid_bits };
++		for (unsigned i = 0; i < 3; i++) {
++			if (!widths[i] || dma >= (1ULL << widths[i]) ||
++			    bytes > (1ULL << widths[i]) - dma) {
++				printf("PICASSO USB: SID e0 guard FAIL: DMA exceeds width %u\n",
++				    widths[i]);
++				return false;
++			}
++		}
++	}
++	printf("PICASSO USB: SID e0 guard PASS\n");
++	return true;
++}
++
++static inline void
++dwc_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(ud.dwc + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static inline uint32_t
++dwc_rd(uint32_t off)
++{
++	return usb_rd(ud.dwc, off);
++}
++
++static void
++ud_sync(uint32_t off, uint32_t len)
++{
++	flush_dcache64((addr64_t)(ud.dma_pa + off), len, TRUE);
++}
++
++static void
++ud_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&ud.sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static int
++ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
++{
++	if (ud.trace_commands) {
++		printf("PICASSO USB: ep%u cmd %u prepare\n", ep, cmd);
++	}
++	if (ud.trace_commands) printf("PICASSO USB: ep%u cmd %u PAR0 write begin 0x%08x\n", ep, cmd, p0);
++	dwc_wr(DEPCMDPAR0(ep), p0);
++	if (ud.trace_commands) printf("PICASSO USB: ep%u cmd %u PAR0 write returned\n", ep, cmd);
++	if (ud.trace_commands) printf("PICASSO USB: ep%u cmd %u PAR1 write begin 0x%08x\n", ep, cmd, p1);
++	dwc_wr(DEPCMDPAR1(ep), p1);
++	if (ud.trace_commands) printf("PICASSO USB: ep%u cmd %u PAR1 write returned\n", ep, cmd);
++	if (ud.trace_commands) printf("PICASSO USB: ep%u cmd %u PAR2 write begin 0x%08x\n", ep, cmd, p2);
++	dwc_wr(DEPCMDPAR2(ep), p2);
++	if (ud.trace_commands) printf("PICASSO USB: ep%u cmd %u PAR2 write returned\n", ep, cmd);
++	if (ud.trace_commands) printf("PICASSO USB: ep%u cmd %u command write begin 0x%08x\n", ep, cmd, cmd | DEPCMD_CMDACT);
++	*(volatile uint32_t *)(ud.dwc + DEPCMD(ep)) = cmd | DEPCMD_CMDACT;
++	if (ud.trace_commands) printf("PICASSO USB: ep%u cmd %u command store emitted (no dsb)\n", ep, cmd);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (ud.trace_commands) printf("PICASSO USB: ep%u cmd %u command dsb returned\n", ep, cmd);
++	if (ud.trace_commands) {
++		printf("PICASSO USB: ep%u cmd %u command write returned\n", ep, cmd);
++		printf("PICASSO USB: ep%u cmd %u command readback begin\n", ep, cmd);
++		uint32_t submitted = dwc_rd(DEPCMD(ep));
++		printf("PICASSO USB: ep%u cmd %u submitted reg 0x%08x\n", ep, cmd, submitted);
++	}
++	for (int i = 0; i < 1000; i++) {
++		uint32_t v = dwc_rd(DEPCMD(ep));
++		if (!(v & DEPCMD_CMDACT)) {
++			uint32_t status = (v >> 12) & 0xf;
++			if (status) {
++				printf("PICASSO USB: ep%u cmd %u status %u\n", ep, cmd, status);
++				return -1;
++			}
++			if (ud.trace_commands) {
++				printf("PICASSO USB: ep%u cmd %u complete reg 0x%08x polls %d\n", ep, cmd, v, i + 1);
++			}
++			return 0;
++		}
++		picasso_usb_busy_wait(1);
++	}
++	printf("PICASSO USB: ep%u cmd %u timeout\n", ep, cmd);
++	return -1;
++}
++
++/* One TRB (at DMA offset trb) on physical endpoint ep. */
++static void
++ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + trb);
++	uint64_t bpa = ud.dma_pa + buf;
++
++	t[0] = (uint32_t)bpa;
++	t[1] = (uint32_t)(bpa >> 32);
++	t[2] = len;
++	t[3] = ctl | TRB_HWO | TRB_LST | TRB_ISP_IMI | TRB_IOC;
++	ud_sync(trb, 16);
++	if (len) {
++		ud_sync(buf, len);
++	}
++	uint64_t tpa = ud.dma_pa + trb;
++	ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
++}
++
++static void
++ud_start_setup(void)
++{
++	ud.state = EP0_SETUP;
++	if (ud.trace_commands) {
++		printf("PICASSO USB: setup TRB prepare va %p pa 0x%llx\n",
++		    (void *)(ud.dma + UD_TRB_OUT), ud.dma_pa + UD_TRB_OUT);
++	}
++	ud_start_trb(0, UD_TRB_OUT, UD_SETUP, 8, TRBCTL_SETUP);
++	if (ud.trace_commands) {
++		printf("PICASSO USB: setup TRB command returned\n");
++	}
++}
++
++static void
++ud_stall(void)
++{
++	ud_epcmd(0, DEPCMD_SETSTALL, 0, 0, 0);
++	ud_start_setup();
++}
++
++/* CDC-ACM descriptors. VID 0x1209/PID 0x0001 = pid.codes test ID. */
++static const uint8_t ud_dev_desc[18] = {
++	18, 1, 0x00, 0x02, 0x02, 0x00, 0x00, 64,
++	0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1,
++};
++static const uint8_t ud_cfg_desc[67] = {
++	9, 2, 67, 0, 2, 1, 0, 0x80, 100,                /* config: 2 interfaces, 200 mA */
++	9, 4, 0, 0, 1, 0x02, 0x02, 0x01, 0,             /* control iface 0: CDC ACM */
++	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 */
++	5, 0x24, 0x01, 0x00, 1,                         /* call management: data iface 1 */
++	4, 0x24, 0x02, 0x02,                            /* ACM: line coding/control-line requests */
++	5, 0x24, 0x06, 0, 1,                            /* union: control 0, data 1 */
++	7, 5, 0x82, 0x03, 0x10, 0x00, 16,               /* ep 0x82 interrupt IN, 16 bytes */
++	9, 4, 1, 0, 2, 0x0a, 0x00, 0x00, 0,             /* data iface 1 alt 0: bulk IN/OUT */
++	7, 5, 0x81, 0x02, 0x40, 0x00, 0,                /* ep 0x81 bulk IN, 64 */
++	7, 5, 0x01, 0x02, 0x40, 0x00, 0,                /* ep 0x01 bulk OUT, 64 */
++};
++static uint8_t ud_line_coding[7] = {
++	0x00, 0xc2, 0x01, 0x00, 0, 0, 8,                /* 115200 8N1 (informational on USB) */
++};
++static const char *const ud_strings[] = {
++	NULL, "picasso", "picasso XNU USB console", "PICASSO01",
++};
++
++static uint32_t
++ud_string(unsigned idx, uint8_t *out)
++{
++	if (idx == 0) {
++		out[0] = 4; out[1] = 3; out[2] = 0x09; out[3] = 0x04;   /* en-US */
++		return 4;
++	}
++	if (idx >= sizeof(ud_strings) / sizeof(ud_strings[0])) {
++		return 0;
++	}
++	const char *str = ud_strings[idx];
++	uint32_t n = 2;
++	for (; *str && n < 126; str++) {
++		out[n++] = (uint8_t)*str;
++		out[n++] = 0;
++	}
++	out[0] = (uint8_t)n;
++	out[1] = 3;
++	return n;
++}
++
++/* SET_CONFIGURATION(1): configure the CDC notification and bulk endpoints. */
++static void
++ud_configure(void)
++{
++	if (ud.configured) {
++		return;
++	}
++	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
++	    ud_epcmd(EP_NOTIFY, DEPCMD_SETEPCONFIG, (3u << 1) | (16u << 3) | (2u << 17), (1u << 8) | (EP_NOTIFY << 25), 0) ||
++	    ud_epcmd(EP_NOTIFY, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (64u << 3), (1u << 8) | (EP_RX << 25), 0) ||
++	    ud_epcmd(EP_RX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    ud_epcmd(EP_TX, DEPCMD_SETEPCONFIG, (2u << 1) | (64u << 3) | (1u << 17),
++	    (1u << 8) | (EP_TX << 25), 0) ||
++	    ud_epcmd(EP_TX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		printf("PICASSO USB: data endpoints setup failed\n");
++		return;
++	}
++	/* Bulk OUT stays enabled but never armed: the host's input NAKs. */
++	dwc_wr(DALEPENA, 0x3u | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_NOTIFY));
++	ud.configured = true;
++	ud.tx_busy = false;
++	ud.notify_busy = false;
++	printf("PICASSO USB: configured, streaming the console\n");
++	{
++		uint8_t *notification = (uint8_t *)(ud.dma + UD_NOTIFY);
++		notification[0] = 0xa1;       /* CDC class/interface, device-to-host */
++		notification[1] = 0x20;       /* SERIAL_STATE */
++		notification[2] = 0; notification[3] = 0;
++		notification[4] = 0; notification[5] = 0;
++		notification[6] = 2; notification[7] = 0;
++		notification[8] = 0; notification[9] = 0;
++		ud.notify_busy = true;
++		ud_start_trb(EP_NOTIFY, UD_TRB_NOTIFY, UD_NOTIFY, UD_NOTIFY_SIZE, TRBCTL_NORMAL);
++	}
++}
++
++static void
++ud_setup(void)
++{
++	const uint8_t *st = (const uint8_t *)(ud.dma + UD_SETUP);
++	uint8_t *data = (uint8_t *)(ud.dma + UD_DATA);
++	uint8_t type = st[0], req = st[1];
++	uint16_t value = (uint16_t)(st[2] | st[3] << 8);
++	uint16_t index = (uint16_t)(st[4] | st[5] << 8);
++	uint16_t length = (uint16_t)(st[6] | st[7] << 8);
++	uint32_t n = 0;
++	bool ok = true;
++
++	ud.data_in = (type & 0x80) != 0;
++	ud.last_request = req;
++	ud.data_length = length;
++	if ((type & 0x60) == 0x20) {   /* CDC class requests on control interface 0 */
++		if ((type & 0x1f) != 1 || index != 0) {
++			ok = false;
++		} else if (req == 0x20 && type == 0x21 && length == sizeof(ud_line_coding)) {
++			/* SET_LINE_CODING: copy the host's seven-byte OUT data stage below. */
++		} else if (req == 0x21 && type == 0xa1) {
++			memcpy(data, ud_line_coding, sizeof(ud_line_coding));
++			n = sizeof(ud_line_coding);
++		} else if (req == 0x22 && type == 0x21 && length == 0) {
++			/* SET_CONTROL_LINE_STATE: bit 0 tracks the host opening the port. */
++			ud.host_open = (value & 1u) != 0;
++		} else if (req == 0x23 && type == 0x21 && length == 0) {
++			/* SEND_BREAK: accepted, no device action. */
++		} else {
++			ok = false;
++		}
++	} else if ((type & 0x60) != 0) {
++		ok = false;
++	} else if (req == 6) {          /* GET_DESCRIPTOR */
++		switch (value >> 8) {
++		case 1: memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
++		case 2: memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc); break;
++		case 3: n = ud_string(value & 0xff, data); ok = n != 0; break;
++		default: ok = false; break;
++		}
++	} else if (req == 5) {          /* SET_ADDRESS */
++		uint32_t dcfg = dwc_rd(DCFG) & ~(0x7fu << 3);
++		dwc_wr(DCFG, dcfg | ((uint32_t)(value & 0x7f) << 3));
++	} else if (req == 9) {          /* SET_CONFIGURATION */
++		if (value == 1) {
++			ud_configure();
++		}
++	} else if (req == 8) {          /* GET_CONFIGURATION */
++		data[0] = ud.configured ? 1 : 0; n = 1;
++	} else if (req == 0) {          /* GET_STATUS */
++		data[0] = 0; data[1] = 0; n = 2;
++	} else if (req == 11 && (type & 0x1f) == 1 && index == 1 && value == 0) {
++		/* SET_INTERFACE: the sole data-interface alternate setting is zero. */
++	} else if (req == 10 && (type & 0x1f) == 1 && index == 1) {
++		data[0] = 0; n = 1;          /* GET_INTERFACE: alternate setting zero */
++	} else {
++		ok = false;
++	}
++	if (!ok) {
++		ud_stall();
++		return;
++	}
++	if (length == 0) {
++		ud.state = EP0_WAIT_STATUS2;
++		return;
++	}
++	ud.state = EP0_DATA;
++	if (ud.data_in) {
++		if (n > length) {
++			n = length;
++		}
++		ud_start_trb(1, UD_TRB_IN, UD_DATA, n, TRBCTL_DATA);
++	} else {
++		ud_start_trb(0, UD_TRB_OUT, UD_DATA, length, TRBCTL_DATA);
++	}
++}
++
++static void
++ud_tx_pump(void)
++{
++	if (!ud.configured || ud.tx_busy) {
++		return;
++	}
++	uint32_t n = pur_copy(&ud.tx_pos, (char *)(ud.dma + UD_TX), UD_TX_SIZE);
++	if (n == 0) {
++		return;
++	}
++	ud.tx_busy = true;
++	ud.chars += n;
++	ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, n, TRBCTL_NORMAL);
++}
++
++static void
++ud_event(uint32_t ev)
++{
++	if (ev & 1) {                   /* device event */
++		uint32_t type = (ev >> 8) & 0xf;
++		if (type == 1) {        /* USB reset */
++			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
++			ud.configured = false;
++			ud.host_open = false;
++			ud.tx_busy = false;
++			ud.state = EP0_SETUP;
++			ud_start_setup();
++		} else if (type == 2) { /* connect done */
++			uint32_t speed = dwc_rd(DSTS) & 7;
++			/* ep0 max packet: 64 at high/full speed (modify action) */
++			ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
++			    (1u << 8) | (1u << 10) | (0u << 25), 0);
++			ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
++			    (1u << 8) | (1u << 10) | (1u << 25), 0);
++			printf("PICASSO USB: connected, speed %u\n", speed);
++		} else if (type == 0) {
++			printf("PICASSO USB: disconnect\n");
++			ud.configured = false;
++			ud.host_open = false;
++			ud.tx_busy = false;
++		}
++		return;
++	}
++	unsigned ep = (ev >> 1) & 0x1f;
++	unsigned type = (ev >> 6) & 0xf;
++	unsigned status = (ev >> 12) & 0xf;
++	if (ep == EP_TX && type == 1) {         /* bulk IN complete */
++		ud.tx_busy = false;
++		return;
++	}
++	if (ep == EP_NOTIFY && type == 1) {    /* CDC interrupt notification complete */
++		ud.notify_busy = false;
++		return;
++	}
++	if (ep > 1) {
++		return;
++	}
++	if (type == 1) {                /* XferComplete */
++		switch (ud.state) {
++		case EP0_SETUP:
++			ud_sync(UD_SETUP, 8);
++			ud_setup();
++			break;
++		case EP0_DATA:
++			if (!ud.data_in && ud.last_request == 0x20 &&
++			    ud.data_length == sizeof(ud_line_coding)) {
++				ud_sync(UD_DATA, ud.data_length);
++				memcpy(ud_line_coding, (const void *)(ud.dma + UD_DATA), sizeof(ud_line_coding));
++			}
++			ud.state = EP0_WAIT_STATUS3;
++			break;
++		case EP0_STATUS:
++			ud_start_setup();
++			break;
++		default:
++			break;
++		}
++		return;
++	}
++	if (type == 3 && status == 2) { /* XferNotReady, control status phase */
++		if (ud.state == EP0_WAIT_STATUS2 || ud.state == EP0_WAIT_STATUS3) {
++			uint32_t ctl = ud.state == EP0_WAIT_STATUS3 ? TRBCTL_STATUS3 : TRBCTL_STATUS2;
++			ud.state = EP0_STATUS;
++			ud_start_trb(ep, ep ? UD_TRB_IN : UD_TRB_OUT, UD_DATA, 0, ctl);
++		}
++	}
++}
++
++static void
++ud_poll(void)
++{
++	uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffffu;
++	if (count) {
++		ud_sync(UD_EVT, UD_EVT_SIZE);
++		for (uint32_t done = 0; done < count; done += 4) {
++			uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
++			ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
++			if (ud.events++ < 200) {
++				printf("PICASSO USB: event 0x%08x\n", ev);
++			}
++			ud_event(ev);
++		}
++		dwc_wr(GEVNTCOUNT, count);
++	}
++	ud_tx_pump();
++}
++
++static void
++ud_poll_serialized(void)
++{
++	if (!os_atomic_cmpxchg(&ud.poll_lock, 0, 1, acquire)) {
++		return;
++	}
++	ud_poll();
++	os_atomic_store(&ud.poll_lock, 0, release);
++}
++
++static void
++picasso_usb_console_drive_poll(void)
++{
++	if (!pur_live || ud.hold) {
++		return;
++	}
++	ud_poll_serialized();
++}
++
++static void
++ud_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	for (;;) {
++		ud_poll_serialized();
++		ud_sleep_ms(2);
++	}
++}
++
++static void
++picasso_usb_park(int hold)
++{
++	if (!hold) {
++		return;
++	}
++	printf("PICASSO USB: holding at bsd_init; SMMU guard %s\n",
++	    ud.smmu_guard ? "PASS" : "FAIL");
++	for (;;) {
++		if (ud.live) {
++			ud_poll_serialized();
++			picasso_usb_busy_wait(1000);
++		} else {
++			ud_sleep_ms(1000);
++		}
++	}
++}
++
++static void
++picasso_usb_select_utmi_clk(vm_offset_t qs)
++{
++	picasso_usb_sync_mark("PICASSO USB: UTMI enter");
++	picasso_usb_sync_mark("PICASSO USB: UTMI before read begin");
++	uint32_t before = usb_rd(qs, QSCRATCH_GENERAL_CFG);
++	picasso_usb_sync_hex("PICASSO USB: UTMI before=", before);
++
++	picasso_usb_sync_mark("PICASSO USB: UTMI disable write begin");
++	usb_wr(qs, QSCRATCH_GENERAL_CFG, before | PIPE_UTMI_CLK_DIS);
++	picasso_usb_sync_mark("PICASSO USB: UTMI disable write done");
++	picasso_usb_busy_wait(5);
++	picasso_usb_sync_mark("PICASSO USB: UTMI disabled read begin");
++	uint32_t disabled = usb_rd(qs, QSCRATCH_GENERAL_CFG);
++	picasso_usb_sync_hex("PICASSO USB: UTMI disabled=", disabled);
++
++	picasso_usb_sync_mark("PICASSO USB: UTMI select write begin");
++	usb_wr(qs, QSCRATCH_GENERAL_CFG,
++	    disabled | PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW);
++	picasso_usb_sync_mark("PICASSO USB: UTMI select write done");
++	picasso_usb_busy_wait(5);
++	picasso_usb_sync_mark("PICASSO USB: UTMI selected read begin");
++	uint32_t selected = usb_rd(qs, QSCRATCH_GENERAL_CFG);
++	picasso_usb_sync_hex("PICASSO USB: UTMI selected=", selected);
++
++	picasso_usb_sync_mark("PICASSO USB: UTMI enable write begin");
++	usb_wr(qs, QSCRATCH_GENERAL_CFG, selected & ~PIPE_UTMI_CLK_DIS);
++	picasso_usb_sync_mark("PICASSO USB: UTMI enable write done");
++	picasso_usb_busy_wait(5);
++	picasso_usb_sync_mark("PICASSO USB: UTMI final read begin");
++	uint32_t after = usb_rd(qs, QSCRATCH_GENERAL_CFG);
++	picasso_usb_sync_hex("PICASSO USB: UTMI final=", after);
++
++	picasso_usb_sync_mark("PICASSO USB: UTMI complete");
++}
++
++static void
++picasso_usb_gadget_start(vm_offset_t dwc, vm_offset_t smmu)
++{
++	vm_offset_t qs;
++	uint32_t devid = usb_rd(dwc, 0xc120);
++	uint32_t hwparams0 = usb_rd(dwc, 0xc140);
++	unsigned awidth = hwparams0 >> 24;
++	uint32_t gctl = usb_rd(dwc, GCTL);
++
++	ud.dwc = dwc;
++	printf("PICASSO USB: controller id=%08x hwparams0=%08x awidth=%u gctl=%08x\n",
++	    devid, hwparams0, awidth, gctl);
++	if ((devid >> 16) != 0x5533 && (devid >> 16) != 0x3331) {
++		printf("PICASSO USB: unsupported DWC3 id; controller untouched\n");
++		return;
++	}
++	if (((gctl >> 12) & 3u) != 2u) {
++		printf("PICASSO USB: not in device mode; controller untouched\n");
++		return;
++	}
++	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("PICASSO USB: no DMA memory\n");
++		return;
++	}
++	/* pmap_find_phys can return 0 for freshly kmem-allocated pages on this
++	 * kernel; kvtophys is the canonical VA-to-PA walk. Fail loudly either way. */
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
++	uint64_t pa = pn ? ptoa_64(pn) : (uint64_t)kvtophys(ud.dma);
++	if (!pa) {
++		printf("PICASSO USB: cannot resolve DMA physical address at %p\n", (void *)ud.dma);
++		return;
++	}
++	ud.dma_pa = pa;
++	for (unsigned off = 0; off < UD_SIZE; off += PAGE_SIZE) {
++		ppnum_t page = pmap_find_phys(kernel_pmap, (addr64_t)(ud.dma + off));
++		if (!page || ptoa_64(page) != ud.dma_pa + off) {
++			printf("PICASSO USB: DMA is not physically contiguous at +0x%x\n",
++			    off);
++			return;
++		}
++	}
++	printf("PICASSO USB: DMA %d pages at va %p pa 0x%llx\n",
++	    (int)(UD_SIZE / PAGE_SIZE), (void *)ud.dma, ud.dma_pa);
++	ud.smmu_guard = picasso_usb_smmu_guard(smmu, ud.dma_pa, UD_SIZE);
++	if (!ud.smmu_guard) {
++		printf("PICASSO USB: SMMU guard refused; controller untouched\n");
++		return;
++	}
++	if (!awidth || awidth < 32 || (awidth < 64 &&
++	    ud.dma_pa + UD_SIZE > (1ULL << awidth))) {
++		printf("PICASSO USB: DMA exceeds DWC3 awidth=%u; controller untouched\n",
++		    awidth);
++		return;
++	}
++	printf("PICASSO USB: hardware guards PASS; issuing controller reset\n");
++	uint32_t usb2phy = usb_rd(dwc, GUSB2PHYCFG0);
++	uint32_t usb3pipe = usb_rd(dwc, GUSB3PIPECTL0);
++	printf("PICASSO USB: pre-stop GCTL=%08x DCFG=%08x DCTL=%08x DSTS=%08x USB2PHYCFG=%08x USB3PIPECTL=%08x\n",
++	    dwc_rd(GCTL), dwc_rd(DCFG), dwc_rd(DCTL), dwc_rd(DSTS), usb2phy,
++	    usb3pipe);
++	dwc_wr(DEVTEN, 0);
++	dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++	unsigned wait;
++	for (wait = 0; wait < 500 &&
++	    !(dwc_rd(DSTS) & DSTS_DEVCTRLHLT); wait++) {
++		picasso_usb_busy_wait(1000);
++	}
++	printf("PICASSO USB: pre-reset halt %s after %u ms DSTS=%08x\n",
++	    (dwc_rd(DSTS) & DSTS_DEVCTRLHLT) ? "done" : "TIMEOUT",
++	    wait, dwc_rd(DSTS));
++	if (!(dwc_rd(DSTS) & DSTS_DEVCTRLHLT)) {
++		return;
++	}
++	dwc_wr(GUSB2PHYCFG0, usb2phy &
++	    ~(GUSB2PHYCFG_SUSPHY | GUSB2PHYCFG_ENBLSLPM));
++	dwc_wr(GUSB3PIPECTL0, usb3pipe & ~GUSB3PIPECTL_SUSPHY);
++
++	printf("PICASSO USB: asserting soft reset\n");
++	dwc_wr(DCTL, DCTL_CSFTRST);
++	printf("PICASSO USB: reset asserted, DCTL 0x%08x\n", dwc_rd(DCTL));
++	int i;
++	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
++		picasso_usb_busy_wait(1000);
++	}
++	printf("PICASSO USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
++	    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
++	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
++		return;
++	}
++
++	qs = dwc + QSCRATCH_OFFSET;
++	printf("PICASSO USB: QSCRATCH %p (wrapper map %p + 0x%x)\n",
++	    (void *)qs, (void *)dwc, QSCRATCH_OFFSET);
++	picasso_usb_select_utmi_clk(qs);
++
++	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
++	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
++	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
++	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
++	ud.evt_pos = 0;
++	ud.trace_commands = true;
++	dwc_wr(DCFG, dwc_rd(DCFG) & ~(7u | (0x7fu << 3)));
++
++	printf("PICASSO USB: ep0 DEPSTARTCFG\n");
++	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0)) { return; }
++	printf("PICASSO USB: ep0 out config\n");
++	if (ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0)) { return; }
++	printf("PICASSO USB: ep0 out fifo\n");
++	if (ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) { return; }
++	printf("PICASSO USB: ep0 in config\n");
++	if (ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0)) { return; }
++	printf("PICASSO USB: ep0 in fifo\n");
++	if (ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) { return; }
++	printf("PICASSO USB: ep0 in resources ready\n");
++	dwc_wr(DALEPENA, 0x3);
++	printf("PICASSO USB: ep0 enabled\n");
++
++	uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL);
++	uint32_t ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
++	printf("PICASSO USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x\n", hs, ss);
++	usb_wr(qs, QSCRATCH_HS_PHY_CTRL,
++	    hs | UTMI_OTG_VBUS_VALID | SW_SESSVLD_SEL);
++	usb_wr(qs, QSCRATCH_SS_PHY_CTRL, ss | LANE0_PWR_PRESENT);
++	printf("PICASSO USB: QSCRATCH after HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x\n",
++	    usb_rd(qs, QSCRATCH_HS_PHY_CTRL),
++	    usb_rd(qs, QSCRATCH_SS_PHY_CTRL));
++
++	ud_start_setup();
++	printf("PICASSO USB: setup TRB armed before RUN (%u retries)\n",
++	    (unsigned)usb_rd(dwc, DEPCMD(0)) >> 12 & 0xfu);
++	dwc_wr(DEVTEN, 0x7u | (1u << 9) | (1u << 11));
++	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
++		picasso_usb_busy_wait(1000);
++	}
++	if (dwc_rd(DSTS) & DSTS_DEVCTRLHLT) {
++		printf("PICASSO USB: controller remained halted; not starting EP0 DMA\n");
++		return;
++	}
++	ud.trace_commands = false;
++	printf("PICASSO USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n",
++	    dwc_rd(DSTS), i, ud.dma_pa);
++	ud.live = true;
++	pur_live = true;
++
++	static const unsigned sample_ms[] = { 0, 1, 10, 100, 500, 1000 };
++	uint64_t previous = ~0ULL;
++	unsigned elapsed_ms = 0;
++	for (unsigned s = 0; s < sizeof(sample_ms) / sizeof(sample_ms[0]); s++) {
++		if (sample_ms[s] > elapsed_ms) {
++			picasso_usb_busy_wait((sample_ms[s] - elapsed_ms) * 1000);
++			elapsed_ms = sample_ms[s];
++		}
++		ud_poll_serialized();
++		uint32_t dsts = dwc_rd(DSTS);
++		uint32_t dctl = dwc_rd(DCTL);
++		uint32_t phycfg = dwc_rd(GUSB2PHYCFG0);
++		uint32_t qcfg = usb_rd(qs, QSCRATCH_GENERAL_CFG);
++		uint32_t event_count = usb_rd(dwc, GEVNTCOUNT) & 0xffffu;
++		uint64_t state = ((uint64_t)dsts << 32) |
++		    ((uint64_t)(uint32_t)ud.events << 16) | event_count;
++		if (state != previous || s == 0 ||
++		    s + 1 == sizeof(sample_ms) / sizeof(sample_ms[0])) {
++			printf("PICASSO USB: STATE t=%ums DSTS=%08x speed=%u link=%u "
++			    "DCTL=%08x phy=%08x qcfg=%08x events=%llu/%u\n",
++			    elapsed_ms, dsts, dsts & 7u, (dsts >> 18) & 0xfu,
++			    dctl, phycfg, qcfg, ud.events, event_count);
++		}
++		previous = state;
++	}
++	if (!ud.hold) {
++		thread_t thread;
++		unsigned handoff_ms = 0;
++		while ((!ud.configured || !ud.host_open) && handoff_ms < 10000) {
++			picasso_usb_busy_wait(1000);
++			ud_poll_serialized();
++			handoff_ms++;
++		}
++		printf("PICASSO USB: live handoff configured=%u host_open=%u after %u ms\n",
++		    ud.configured ? 1u : 0u, ud.host_open ? 1u : 0u, handoff_ms);
++		ud_poll_serialized();
++		/* Let the host attach to the newly enumerated tty and drain the
++		 * early console before control returns to bsd_init. */
++		for (unsigned settle_ms = 0; settle_ms < 500; settle_ms++) {
++			picasso_usb_busy_wait(1000);
++			ud_poll_serialized();
++		}
++		kern_return_t result = kernel_thread_start(ud_thread, NULL, &thread);
++		if (result == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			printf("PICASSO USB: background poller started\n");
++			ud_poll_serialized();
++		} else {
++			printf("PICASSO USB: background poller failed (%d)\n", result);
++		}
++	}
++}
++
++void
++picasso_usb_console_start(void)
++{
++	int enabled = 0;
++	int hold = 0;
++	int bind_smmu = 0;
++
++	PE_parse_boot_argn("picasso_usb", &enabled, sizeof(enabled));
++	PE_parse_boot_argn("picasso_usb_hold", &hold, sizeof(hold));
++	PE_parse_boot_argn("picasso_usb_smmu", &bind_smmu, sizeof(bind_smmu));
++	ud.hold = hold != 0;
++	if (!enabled) {
++		return;
++	}
++	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	if (gcc == 0) {
++		printf("PICASSO USB: GCC map failed\n");
++		return;
++	}
++	uint32_t gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	uint32_t master = usb_rd(gcc, GCC_USB30_PRIM_MASTER);
++	uint32_t sleep = usb_rd(gcc, GCC_USB30_PRIM_SLEEP);
++	uint32_t mock = usb_rd(gcc, GCC_USB30_PRIM_MOCK_UTMI);
++	uint32_t cfg = usb_rd(gcc, GCC_CFG_NOC_USB3_PRIM);
++	uint32_t aggre = usb_rd(gcc, GCC_AGGRE_USB3_PRIM);
++	uint32_t clkref = usb_rd(gcc, GCC_USB3_PRIM_CLKREF);
++	printf("PICASSO USB: GCC power=%08x master=%08x cfg=%08x aggre=%08x\n",
++	    gdscr, master, cfg, aggre);
++	printf("PICASSO USB: GCC sleep=%08x mock_utmi=%08x clkref=%08x\n",
++	    sleep, mock, clkref);
++	if (!(gdscr & (1u << 31)) || ((master | cfg | aggre) & (1u << 31))) {
++		printf("PICASSO USB: clocks/power unavailable; controller untouched\n");
++		picasso_usb_park(hold);
++		return;
++	}
++	vm_size_t smmu_size = bind_smmu == 2 ? PAGE_SIZE : SMMU_SIZE;
++	vm_offset_t smmu = ml_io_map(SMMU_PA, smmu_size);
++	if (smmu == 0) {
++		printf("PICASSO USB: SMMU map failed\n");
++		picasso_usb_park(hold);
++		return;
++	}
++	printf("PICASSO USB: SMMU mapped %u bytes\n", (unsigned)smmu_size);
++	if (bind_smmu == 3) {
++		ud.smmu_guard = picasso_usb_smmu_probe_page(smmu);
++		printf("PICASSO USB: SMMU probe pre-DWC full-map %s\n",
++		    ud.smmu_guard ? "PASS" : "FAIL");
++		picasso_usb_park(hold);
++		return;
++	}
++	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++	if (dwc == 0) {
++		printf("PICASSO USB: DWC3 map failed\n");
++		picasso_usb_park(hold);
++		return;
++	}
++	ud.dwc = dwc;
++	printf("PICASSO USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x DCTL 0x%08x DSTS 0x%08x DCFG 0x%08x\n",
++	    usb_rd(dwc, 0xc120), usb_rd(dwc, GCTL), usb_rd(dwc, DCTL),
++	    usb_rd(dwc, DSTS), usb_rd(dwc, DCFG));
++	if (bind_smmu == 7) {
++		vm_offset_t qs = dwc + QSCRATCH_OFFSET;
++		printf("PICASSO USB: QSCRATCH read-only probe pa=0x%x va=%p\n",
++		    QSCRATCH_PA, (void *)qs);
++		picasso_usb_qscratch_probe(qs);
++		picasso_usb_park(hold);
++		return;
++	}
++	if (bind_smmu == 4) {
++		ud.smmu_guard = picasso_usb_smmu_probe_page(smmu);
++		printf("PICASSO USB: SMMU probe post-DWC full-map %s\n",
++		    ud.smmu_guard ? "PASS" : "FAIL");
++		picasso_usb_park(hold);
++		return;
++	}
++	if (bind_smmu == 2) {
++		ud.smmu_guard = picasso_usb_smmu_probe_page(smmu);
++		printf("PICASSO USB: SMMU probe one-page %s\n",
++		    ud.smmu_guard ? "PASS" : "FAIL");
++		picasso_usb_park(hold);
++		return;
++	}
++	if (bind_smmu) {
++		struct picasso_usb_smmu_bind plan;
++		bool plan_only = bind_smmu == 5;
++		bool verbose_plan = bind_smmu == 5 || bind_smmu == 6;
++		if (!picasso_usb_smmu_plan_bind(smmu, &plan, verbose_plan)) {
++			printf("PICASSO USB: SMMU bind plan FAIL\n");
++			picasso_usb_park(hold);
++			return;
++		}
++		printf("PICASSO USB: SMMU bind plan PASS slot=%u bank=%u\n",
++		    plan.slot, plan.bank);
++		if (plan_only) {
++			picasso_usb_park(hold);
++			return;
++		}
++		printf("PICASSO USB: quiescing DWC3 before SMMU bind\n");
++		dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++		unsigned wait;
++		for (wait = 0; wait < 500 &&
++		    !(dwc_rd(DSTS) & DSTS_DEVCTRLHLT); wait++) {
++			picasso_usb_busy_wait(1000);
++		}
++		printf("PICASSO USB: DWC3 halt %s after %u ms DSTS=%08x\n",
++		    (dwc_rd(DSTS) & DSTS_DEVCTRLHLT) ? "done" : "TIMEOUT",
++		    wait, dwc_rd(DSTS));
++		if (!(dwc_rd(DSTS) & DSTS_DEVCTRLHLT) ||
++		    !picasso_usb_smmu_apply_bind(smmu, &plan)) {
++			printf("PICASSO USB: SMMU bind refused; controller untouched\n");
++			picasso_usb_park(hold);
++			return;
++		}
++	}
++	ud.smmu_guard = picasso_usb_smmu_guard(smmu, 0, 0);
++	if (!ud.smmu_guard) {
++		printf("PICASSO USB: SID e0 guard refused; controller untouched\n");
++		picasso_usb_park(hold);
++		return;
++	}
++	if (enabled >= 2) {
++		picasso_usb_gadget_start(dwc, smmu);
++	} else {
++		printf("PICASSO USB: route test complete; DWC3 remains halted\n");
++	}
++	picasso_usb_park(hold);
++}
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb558ee..82e3e51 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -506,6 +506,10 @@ bsd_init(void)
+ 	throttle_init();
+ 
+ 	printf(copyright);
++	{
++		extern void picasso_usb_console_start(void);
++		picasso_usb_console_start();
++	}
+ 
+ #if CONFIG_DEV_KMEM
+ 	bsd_init_kprintf("calling dev_kmem_init\n");
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index e6d38d3..3a02700 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -259,6 +259,12 @@ _cnputc(char c, bool poll)
+ 	if (c == '\n') {
+ 		_cnputc('\r', poll);
+ 	}
++	{
++		extern void picasso_usb_log_char(char);
++		/* stored once per character, after the CR expansion,
++		 * recursive '\r' also lands here and is stored exactly once. */
++		picasso_usb_log_char(c);
++	}
+ 
+ 	cons_ops[idx].putc(c, poll);
+ }

@@ -162,6 +162,10 @@ kernel_args = [
   # root nub, and whether NativeUfs::probe was called at all. The log is
   # long -- capture it in screen photos in sequence.
   "io=0x232",
+  # USB console (usb branch): 1 = state probe only, 2 = run the CDC-ACM
+  # console streaming (DWC3 device mode; the PC sees a serial port carrying
+  # the last 256 KiB of console text and then live output).
+  "picasso_usb=2",
 ]
 # Stage-5 blind-spot instrumentation (docs/zh/guide/debugging.md 颜色条):
 # scripts/patch-xnu-entry-probe.py (ported from UniXNU-sheng; it adapts itself
