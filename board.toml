@@ -63,6 +63,7 @@ kernelcache_sha256 = ""
 slide = "-0x1000000"
 early_security_init = "com.apple.driver.AppleMobileFileIntegrity=0xfffffff005ab4ae0"
 roots = [
+  "com.apple.AppleFSCompression.AppleFSCompressionTypeZlib",
   "com.apple.driver.AppleARMPlatform",
   "com.apple.driver.AppleARMWatchdogTimer",
   "com.apple.driver.AppleMobileFileIntegrity",
@@ -128,7 +129,10 @@ BUILDID_STRING = "picasso-research"
 # Payload: a FAT volume with UniXNU config + kernel + ADT. Loader (DarwinBoot) is in the firmware.
 [payload]
 volume = "PICASSOESP"
-size_mib = 54
+# The embedded 128-KiB-record manifests add about 2.2 MiB to kernel.macho.
+# 55 MiB keeps the payload below the build driver's 95% content threshold
+# while adding only one MiB to the temporary boot image.
+size_mib = 55
 loader = "firmware"
 title = "Boot"
 dram_size = "0x80000000"
@@ -154,6 +158,15 @@ kernel_args = [
   # short delay -- the stage-6 data we need, without the shim. If AMFI
   # then panics "No PMGR", the shim port becomes the next task.
   "native-ufs-probe=12",
+  # Let bsd_init start the CDC console before the UFS publication diagnostic
+  # runs, so a later UFS panic still has a complete host-side log.
+  "native-ufs-start-delay=5",
+  # IOSleep does not reliably make progress this early with cpus=1. The
+  # timebase+yield path has been exercised on hardware; scans also yield at
+  # every 128 KiB batch so CDC keeps draining.
+  "native-ufs-delay-yield=1",
+  # The embedded manifest removes the 9.4 GiB scan, so enable command tracing
+  # for the first hardware qualification of the new bring-up path.
   "native-ufs-diagnostics=1",
   # IOKit matching trace: kIOLogMatch(0x10) | kIOLogProbe(0x2) |
   # kIOLogConfig(0x20) | kIOLogCatalogue(0x200). Three silent runs in a row
@@ -166,6 +179,11 @@ kernel_args = [
   # console streaming (DWC3 device mode; the PC sees a serial port carrying
   # the last 256 KiB of console text and then live output).
   "picasso_usb=2",
+  # The pre-existing apps-SMMU route only matches after the USB console
+  # driver installs its guarded plan/apply bypass for stream 0xe0. Without
+  # this, the read-only guard sees zero matches and deliberately leaves the
+  # controller untouched.
+  "picasso_usb_smmu=6",
 ]
 # Stage-5 blind-spot instrumentation (docs/zh/guide/debugging.md 颜色条):
 # scripts/patch-xnu-entry-probe.py (ported from UniXNU-sheng; it adapts itself
@@ -233,6 +251,10 @@ panic_screen = true
 [payload.adt]
 tool = "scripts/make-picasso-adt.py"
 chip_id = "7250"
+# Select the authenticated OS APFS volume by its published IOMedia UUID. The
+# VerifiedRoot window identity check independently binds this UUID to the
+# owner-signed image before the block device is published.
+root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
 # DarwinBoot requests one contiguous window of this size from the firmware and
 # hands it to the kernel as boot_args.memSize. The kernel then builds its physmap
 # over exactly that range, so the window has to fit inside a single
