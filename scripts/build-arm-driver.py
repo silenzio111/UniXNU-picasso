@@ -5,12 +5,14 @@ Used inside the assembled UniXNU tree. Runs the recorded compiler and xcrun
 ar; writes only build/<component>/. Does not access a device.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import struct
 import subprocess
 import sys
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 if not (ROOT / 'build/xnu').is_dir() and (ROOT / 'out/picasso/tree/build/xnu').is_dir():
@@ -63,6 +65,102 @@ def compile_file(source: Path, destination: Path, record: dict, extra_flags: lis
     if deployment != (2, 0x110000):
         raise SystemExit(f'Expected iOS 17 deployment for {destination}, got {deployment}')
     return destination
+
+
+def prelink_slide():
+    board = Path(os.environ['UNIXNU_DEVICE']) / 'board.toml'
+    if not board.is_file():
+        raise SystemExit(f'NativeUfs requires the device board.toml, not found at {board}')
+    config = tomllib.loads(board.read_text())
+    try:
+        return int(config['kernel']['prelink']['slide'], 0)
+    except (KeyError, TypeError, ValueError) as error:
+        raise SystemExit(f'NativeUfs requires [kernel.prelink].slide in {board}') from error
+
+
+def build_storage_bindings(out: Path):
+    # These are the stock IOStorageFamily addresses. emit_prelink moves that
+    # component by board.toml's slide, including both text and the metaclass.
+    stock = {
+        '__ZN20IOBlockStorageDevice10gMetaClassE': 0xfffffff007add1d0,
+        '__ZN20IOBlockStorageDevice11requestIdleEv': 0xfffffff00596f050,
+        '__ZN20IOBlockStorageDevice13doSetPriorityEP26IOBlockStorageDeviceExtentjh': 0xfffffff00596f068,
+        '__ZN20IOBlockStorageDevice13setPropertiesEP8OSObject': 0xfffffff00596ef38,
+        '__ZN20IOBlockStorageDevice20doGetProvisionStatusEyyPjP35IOBlockStorageProvisionDeviceExtenty': 0xfffffff00596f08c,
+        '__ZN20IOBlockStorageDevice4initEP12OSDictionary': 0xfffffff00596ee30,
+        '__ZN20IOBlockStorageDevice7doUnmapEP26IOBlockStorageDeviceExtentjj': 0xfffffff00596f05c,
+        '__ZN20IOBlockStorageDeviceC2EPK11OSMetaClass': 0xfffffff00596ed98,
+        '__ZN20IOBlockStorageDeviceD2Ev': 0xfffffff00596edb8,
+        '__ZNK20IOBlockStorageDevice11getPropertyEPK8OSSymbol': 0xfffffff00596ee88,
+        '__ZTV20IOBlockStorageDevice': 0xfffffff006cb44c0,
+    }
+    slide = prelink_slide()
+    bindings = {name: address + slide for name, address in stock.items()}
+    assembly = out / 'storage-bindings.S'
+    assembly.write_text(''.join(f'.globl {name}\n.set {name}, {address:#x}\n'
+                                for name, address in sorted(bindings.items())))
+    audit = out / 'storage-bindings.json'
+    audit.write_text(json.dumps({
+        'component': 'com.apple.iokit.IOStorageFamily',
+        'stock_base': {name: hex(address) for name, address in stock.items()},
+        'slide': hex(slide),
+        'candidate_targets': {name: hex(address) for name, address in bindings.items()},
+        'runtime_qualified': False,
+    }, indent=2) + '\n')
+    object_path = out / 'storage-bindings.o'
+    subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-c',
+                    str(assembly), '-o', str(object_path)], check=True)
+    return object_path
+
+
+def build_verified_root_policy(record: dict, out: Path, extra_flags: list):
+    policy = ROOT / 'build/verified-root-picasso'
+    kit = ROOT / 'kits/VerifiedRoot'
+    attestation = policy / 'attestation.json'
+    assembly = policy / 'policy.S'
+    if not attestation.is_file() or not assembly.is_file():
+        raise SystemExit(
+            'NativeUfs requires a generated header-only VerifiedRoot policy; run '
+            'scripts/build-picasso-verified-policy.py first'
+        )
+    audit = json.loads(attestation.read_text())
+    embedded = audit.get('kernel_embedded', {})
+    if (audit.get('schema') != 'picasso-verified-root-policy-v1' or
+            audit.get('root_image_modified') is not False or
+            audit.get('partition_write_operations') is not False or
+            embedded.get('auth_record_bytes') != 131072 or
+            embedded.get('hash_tables_embedded') is not True or
+            embedded.get('runtime_scan_required') is not False):
+        raise SystemExit('VerifiedRoot policy attestation has an unsupported or unsafe shape')
+    windows = audit.get('windows')
+    if (not isinstance(windows, list) or len(windows) != 2 or
+            {window.get('name') for window in windows} != {'OS', 'SystemOS'} or
+            any(window.get('auth_record_bytes') != 131072 or
+                window.get('header_signature_bytes') != 544 or
+                window.get('openssl_signature_verified') is not True
+                for window in windows)):
+        raise SystemExit('VerifiedRoot policy attestation does not contain two signed embedded tables')
+    if hashlib.sha256(assembly.read_bytes()).hexdigest() != audit.get('policy_assembly_sha256'):
+        raise SystemExit('VerifiedRoot policy assembly differs from its signed-host attestation')
+
+    kit_include = kit / 'include'
+    objects = []
+    for source, destination in (
+        (kit / 'src/verified_root.c', out / 'verified_root.o'),
+        (kit / 'adapters/xnu_crypto.c', out / 'verified_root_xnu_crypto.o'),
+    ):
+        if not source.is_file():
+            raise SystemExit(f'VerifiedRoot source is missing: {source}')
+        compile_file(source, destination, record, extra_flags, is_c=True)
+        objects.append(destination)
+    policy_object = out / 'verified-root-policy.o'
+    subprocess.run(
+        ['xcrun', 'clang', '-target', 'arm64-apple-ios17.0',
+         '-c', str(assembly), '-o', str(policy_object)],
+        check=True,
+    )
+    objects.append(policy_object)
+    return objects
 
 
 def build_adreno(record: dict):
@@ -146,6 +244,8 @@ def main():
         'NativeUfs': ('native-ufs', 'NativeUfs', 'NativeUfs.cpp', [
             '-I', str(ROOT / 'build/storage-abi/include'),
             '-I', str(ROOT / 'drivers/NativeUfs'),
+            '-I', str(ROOT / 'kits/VerifiedRoot/include'),
+            '-DNATIVE_VERIFIED_BLOCK=1',
         ]),
     }
     dir_name, sub_dir, src_file, extra_flags = out_map[args.component]
@@ -157,34 +257,8 @@ def main():
 
     extra_objects = []
     if args.component == 'NativeUfs':
-        bindings_s = out / 'storage-bindings.S'
-        bindings_s.write_text("""
-.globl __ZN20IOBlockStorageDevice10gMetaClassE
-.set __ZN20IOBlockStorageDevice10gMetaClassE, 0xfffffff007add1d0
-.globl __ZN20IOBlockStorageDevice11requestIdleEv
-.set __ZN20IOBlockStorageDevice11requestIdleEv, 0xfffffff00596f050
-.globl __ZN20IOBlockStorageDevice13doSetPriorityEP26IOBlockStorageDeviceExtentjh
-.set __ZN20IOBlockStorageDevice13doSetPriorityEP26IOBlockStorageDeviceExtentjh, 0xfffffff00596f068
-.globl __ZN20IOBlockStorageDevice13setPropertiesEP8OSObject
-.set __ZN20IOBlockStorageDevice13setPropertiesEP8OSObject, 0xfffffff00596ef38
-.globl __ZN20IOBlockStorageDevice20doGetProvisionStatusEyyPjP35IOBlockStorageProvisionDeviceExtenty
-.set __ZN20IOBlockStorageDevice20doGetProvisionStatusEyyPjP35IOBlockStorageProvisionDeviceExtenty, 0xfffffff00596f08c
-.globl __ZN20IOBlockStorageDevice4initEP12OSDictionary
-.set __ZN20IOBlockStorageDevice4initEP12OSDictionary, 0xfffffff00596ee30
-.globl __ZN20IOBlockStorageDevice7doUnmapEP26IOBlockStorageDeviceExtentjj
-.set __ZN20IOBlockStorageDevice7doUnmapEP26IOBlockStorageDeviceExtentjj, 0xfffffff00596f05c
-.globl __ZN20IOBlockStorageDeviceC2EPK11OSMetaClass
-.set __ZN20IOBlockStorageDeviceC2EPK11OSMetaClass, 0xfffffff00596ed98
-.globl __ZN20IOBlockStorageDeviceD2Ev
-.set __ZN20IOBlockStorageDeviceD2Ev, 0xfffffff00596edb8
-.globl __ZNK20IOBlockStorageDevice11getPropertyEPK8OSSymbol
-.set __ZNK20IOBlockStorageDevice11getPropertyEPK8OSSymbol, 0xfffffff00596ee88
-.globl __ZTV20IOBlockStorageDevice
-.set __ZTV20IOBlockStorageDevice, 0xfffffff006cb44c0
-""")
-        bindings_o = out / 'storage-bindings.o'
-        subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-c', str(bindings_s), '-o', str(bindings_o)], check=True)
-        extra_objects.append(bindings_o)
+        extra_objects.extend(build_verified_root_policy(record, out, extra_flags))
+        extra_objects.append(build_storage_bindings(out))
 
     archive = out / ('lib' + args.component + '.a')
     archive.unlink(missing_ok=True)
