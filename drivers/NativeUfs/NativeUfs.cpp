@@ -28,6 +28,8 @@ extern const uint8_t verified_root_key[];
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSString.h>
 #include <libkern/libkern.h>
+#include <kern/clock.h>
+#include <mach/mach_time.h>
 #include <pexpert/pexpert.h>
 #include <kern/debug.h>
 #include "GccUfs.h"
@@ -60,6 +62,12 @@ volatile uint32_t native_ufs_uic_status = 0;
 volatile uint32_t native_ufs_uic_result = 0;
 }
 
+// A weak definition keeps the optional observer linkable when no downstream
+// component supplies one. A strong definition still overrides it.
+extern "C" __attribute__((weak)) void boot_progress_poll (void)
+{
+}
+
 class NativeUfs : public IOService {
   OSDeclareDefaultStructors (NativeUfs)
   OSSharedPtr<IOMemoryMap> fMap;
@@ -70,6 +78,7 @@ class NativeUfs : public IOService {
   void inspectSmmu (void);
   void inspectContextBanks (void);
   bool startRoot (IOService *provider);
+  static void deferredRootStart (void *argument, wait_result_t);
   static bool waitSet (uintptr_t base, unsigned offset, uint32_t mask, unsigned loops);
 public:
   IOService *probe (IOService *provider, SInt32 *score) override;
@@ -916,6 +925,43 @@ static void hostWrite (unsigned offset, uint32_t value)
 
 #include "RootCommands.h"
 
+static bool waitTimebaseNanosecondsWithYield (uint64_t duration)
+{
+  uint64_t delay = 0, slice = 0;
+  nanoseconds_to_absolutetime (duration, &delay);
+  nanoseconds_to_absolutetime (10000000ULL, &slice);
+  if (!delay || !slice) {
+    return false;
+  }
+  uint64_t start = mach_absolute_time ();
+  uint64_t deadline = start + delay;
+  while (mach_absolute_time () < deadline) {
+    uint64_t sliceEnd = mach_absolute_time () + slice;
+    if (sliceEnd > deadline) {
+      sliceEnd = deadline;
+    }
+    while (mach_absolute_time () < sliceEnd) {
+      asm volatile ("yield" ::: "memory");
+    }
+    thread_yield_internal (0);
+  }
+  return true;
+}
+
+static bool waitTimebaseMillisecondsWithYield (unsigned milliseconds)
+{
+  return waitTimebaseNanosecondsWithYield (
+    static_cast<uint64_t> (milliseconds) * 1000000ULL
+  );
+}
+
+static bool waitTimebaseSecondsWithYield (unsigned seconds)
+{
+  return waitTimebaseNanosecondsWithYield (
+    static_cast<uint64_t> (seconds) * 1000000000ULL
+  );
+}
+
 // Bring the live controller up for reading: map, SMMU pass-through for the UFS stream, take over
 // the request list, wake the device from UFS-PowerDown and wait for LUN 0 to be ready.
 // `why` receives a short reason on failure.
@@ -941,6 +987,7 @@ static bool hostBringUp (const char **why)
     *why = "controller map";
     return false;
   }
+  IOLog ("NATIVE_UFS_BRINGUP controller mapped\n");
   if (gRootDiagnosticEnabled) {
     IOLog ("NATIVE_UFS_BRINGUP controller_map=end hc=%p\n", (void *) gHost.hc);
   }
@@ -980,6 +1027,8 @@ static bool hostBringUp (const char **why)
     *why = "DMA address/contiguity";
     return false;
   }
+  IOLog ("NATIVE_UFS_BRINGUP dma ready phys=%llx bytes=%llx\n",
+         gHost.phys, contiguous);
   if (gRootDiagnosticEnabled) {
     IOLog ("NATIVE_UFS_BRINGUP dma phys=%llx bytes=%llx\n", gHost.phys, contiguous);
   }
@@ -991,6 +1040,7 @@ static bool hostBringUp (const char **why)
     IOLog ("NATIVE_UFS_BRINGUP stop_queue=begin\n");
   }
   if (!hostStopQueue (why)) return false;
+  IOLog ("NATIVE_UFS_BRINGUP queue stopped\n");
   if (gRootDiagnosticEnabled) {
     IOLog ("NATIVE_UFS_BRINGUP stop_queue=end\n");
   }
@@ -998,6 +1048,8 @@ static bool hostBringUp (const char **why)
     IOLog ("NATIVE_UFS_BRINGUP smmu=begin\n");
   }
   smmuBypassStream (0x60, gHost.smmuMap, report, gHost.phys, kDmaBytes);
+  IOLog ("NATIVE_UFS_BRINGUP smmu ready slot=%x bank=%u\n",
+         report[0] & 0xffff, report[0] >> 16);
   if (gRootDiagnosticEnabled) {
     IOLog ("NATIVE_UFS_BRINGUP smmu=end\n");
   }
@@ -1014,6 +1066,7 @@ static bool hostBringUp (const char **why)
     IOLog ("NATIVE_UFS_BRINGUP start_queue=begin\n");
   }
   if (!hostStartQueue (why)) return false;
+  IOLog ("NATIVE_UFS_BRINGUP queue started\n");
   if (gRootDiagnosticEnabled) {
     IOLog ("NATIVE_UFS_BRINGUP start_queue=end\n");
   }
@@ -1024,6 +1077,7 @@ static bool hostBringUp (const char **why)
     *why = "NOP OUT";
     return false;
   }
+  IOLog ("NATIVE_UFS_BRINGUP nop ok\n");
   if (gRootDiagnosticEnabled) {
     IOLog ("NATIVE_UFS_BRINGUP nop=ok\n");
   }
@@ -1034,9 +1088,7 @@ static bool hostBringUp (const char **why)
     *why = "power mode query";
     return false;
   }
-  if (gRootDiagnosticEnabled) {
-    IOLog ("NATIVE_UFS_BRINGUP power=%x\n", power);
-  }
+  IOLog ("NATIVE_UFS_BRINGUP power=%x\n", power);
   gRootDiagnostic.power = power;
   if ((power & 0xff) != 0x11) {
     gRootDiagnostic.stage = "device wake";
@@ -1048,7 +1100,11 @@ static bool hostBringUp (const char **why)
       *why = "wake (START STOP UNIT)";
       return false;
     }
-    IOSleep (50);
+    if (!waitTimebaseMillisecondsWithYield (50)) {
+      gHost.ready = false;
+      *why = "device wake delay";
+      return false;
+    }
   }
   gRootDiagnostic.stage = "LUN ready";
   if (gRootDiagnosticEnabled) {
@@ -1062,10 +1118,11 @@ static bool hostBringUp (const char **why)
       if (gRootDiagnosticEnabled) {
         IOLog ("NATIVE_UFS_BRINGUP lun_ready=ok attempt=%u\n", attempt);
       }
+      IOLog ("NATIVE_UFS_BRINGUP lun ready\n");
       return true;
     }
     if (gHost.poisoned) break;
-    IOSleep (10);
+    if (!waitTimebaseMillisecondsWithYield (10)) break;
   }
   gHost.ready = false;
   *why = "LUN 0 not ready";
@@ -1304,6 +1361,7 @@ class NativeUfsBlock : public IOBlockStorageDevice {
   bool online = false;
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
   struct vr_view verified = {};
+  uint32_t verifiedRecordBytes = 0;
   vm_offset_t verifiedStorage = 0;
   vm_size_t verifiedStorageBytes = 0;
   bool configureVerification ();
@@ -1389,8 +1447,9 @@ bool NativeUfsBlock::configure (const char *name, uint64_t absoluteOffset, uint6
     return false;
   }
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
-  // Reads are served only after each 4096-byte integrity block verifies against the owner-signed
-  // policy; without a matching policy the device is never published.
+  // Reads are served only after the complete 128-KiB record verifies against
+  // the owner-signed embedded table; without a matching policy the device is
+  // never published.
   return configureVerification ();
 #else
   return true;
@@ -1403,6 +1462,62 @@ volatile uint64_t native_ufs_verified_blocks = 0;
 volatile uint64_t native_ufs_verify_ticks = 0, native_ufs_read_ticks = 0;
 static inline uint64_t timerTicks (void) {uint64_t v; __asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r" (v)); return v;}
 volatile uint32_t native_ufs_integrity_failures = 0;
+
+static bool equalDigest (const uint8_t *a, const uint8_t *b, size_t length)
+{
+  uint8_t difference = 0;
+  for (size_t index = 0; index < length; ++index) {
+    difference |= a[index] ^ b[index];
+  }
+  return difference == 0;
+}
+
+static bool verifyEmbeddedRecord (const vr_view *view, uint32_t recordBytes,
+                                  uint64_t index, const void *data, size_t length)
+{
+  if (!view || !view->hashes || !data || !recordBytes || !vr_xnu_crypto.sha256 ||
+      index >= view->block_count) {
+    return false;
+  }
+  uint64_t offset = index * recordBytes;
+  if (offset >= view->image_bytes) {
+    return false;
+  }
+  uint64_t remaining = view->image_bytes - offset;
+  size_t expected = remaining < recordBytes ? static_cast<size_t> (remaining) : recordBytes;
+  uint8_t digest[32];
+  return length == expected &&
+         vr_xnu_crypto.sha256 (data, length, digest) &&
+         equalDigest (digest, view->hashes + index * 32, sizeof (digest));
+}
+
+static bool verifyPolicyHeader (const uint8_t *manifest, uint64_t manifestBytes,
+                                const uint8_t *key)
+{
+  static const uint8_t magic[8] = {'V', 'R', 'O', 'O', 'T', '0', '1', 0};
+  static const uint8_t keyMagic[8] = {'V', 'R', 'O', 'O', 'T', 'K', 'E', 'Y'};
+  uint8_t digest[32];
+  if (!manifest || !key || manifestBytes != VR_HEADER_BYTES + VR_SIGNATURE_BYTES ||
+      !equalDigest (manifest, magic, sizeof (magic)) ||
+      !vr_xnu_crypto.sha256 || !vr_xnu_crypto.rsa3072_sha256 ||
+      !equalDigest (key, keyMagic, sizeof (keyMagic)) ||
+      !(key[8] & 0x80) || !(key[391] & 1) ||
+      key[392] != 1 || key[393] != 0 || key[394] != 1) {
+    return false;
+  }
+  if (!vr_xnu_crypto.sha256 (key, VR_KEY_BYTES, digest) ||
+      !equalDigest (digest, manifest + 120, sizeof (digest))) {
+    return false;
+  }
+  if (!vr_xnu_crypto.sha256 (manifest, VR_HEADER_BYTES, digest)) {
+    return false;
+  }
+  return vr_xnu_crypto.rsa3072_sha256 (
+    key, digest, manifest + VR_HEADER_BYTES
+  ) != 0;
+}
+
+static constexpr uint32_t kEmbeddedAuthRecordBytes = 128 * 1024;
 
 bool NativeUfsBlock::configureVerification ()
 {
@@ -1419,14 +1534,12 @@ bool NativeUfsBlock::configureVerification ()
   }
   for (uint64_t index = 0; index < verified_root_policy_count; ++index) {
     const NativeVerifiedBlockPolicy &policy = verified_root_policies[index];
-    if (!policy.manifest || policy.manifestBytes < VR_HEADER_BYTES + VR_SIGNATURE_BYTES) {
+    if (!policy.manifest ||
+        policy.manifestBytes < VR_HEADER_BYTES + VR_SIGNATURE_BYTES) {
       gRootDiagnostic.stage = "policy envelope invalid";
       return false;
     }
-    uint64_t imageBytes = 0;
-    for (unsigned i = 0; i < 8; ++i) {
-      imageBytes |= static_cast<uint64_t> (policy.manifest[24 + i]) << (8 * i);
-    }
+    uint64_t imageBytes = le64 (policy.manifest + 24);
     if (imageBytes != bytes) {
       continue;
     }
@@ -1441,31 +1554,75 @@ bool NativeUfsBlock::configureVerification ()
     gRootDiagnostic.stage = "no capacity-matching policy";
     return false;
   }
-  gRootDiagnostic.stage = "policy storage";
-  vm_size_t tableBytes = round_page (static_cast<vm_size_t> (manifestBytes));
-  if (tableBytes < manifestBytes || tableBytes > UINT64_MAX - 4096) {
-    gRootDiagnostic.stage = "policy size overflow";
+  if (le32 (manifest + 8) != 1 || le32 (manifest + 12) != VR_HEADER_BYTES ||
+      le32 (manifest + 16) != kEmbeddedAuthRecordBytes || le32 (manifest + 20) != 0 ||
+      le64 (manifest + 152) < 1) {
+    gRootDiagnostic.stage = "signed header fields";
+    return false;
+  }
+  gRootDiagnostic.stage = "owner signature";
+  if (!verifyPolicyHeader (
+        manifest, VR_HEADER_BYTES + VR_SIGNATURE_BYTES, verified_root_key
+      )) {
+    gRootDiagnostic.verify = VR_SIGNATURE;
+    return false;
+  }
+
+  uint64_t blockCount = (bytes + kEmbeddedAuthRecordBytes - 1) / kEmbeddedAuthRecordBytes;
+  if (le64 (manifest + 32) != blockCount ||
+      blockCount > (UINT64_MAX - VR_HEADER_BYTES - VR_SIGNATURE_BYTES) / 32) {
+    gRootDiagnostic.stage = "signed image block count";
+    return false;
+  }
+  uint64_t envelopeBytes = VR_HEADER_BYTES + VR_SIGNATURE_BYTES + blockCount * 32;
+  if (manifestBytes != envelopeBytes) {
+    gRootDiagnostic.stage = "embedded policy envelope length";
+    return false;
+  }
+  vm_size_t tableBytes = round_page (static_cast<vm_size_t> (envelopeBytes));
+  if (envelopeBytes > SIZE_MAX || tableBytes < envelopeBytes ||
+      tableBytes > UINT64_MAX - 4096) {
+    gRootDiagnostic.stage = "hash table size overflow";
     return false;
   }
   verifiedStorageBytes = tableBytes + 4096;
   gRootDiagnostic.stage = "policy allocation";
+  IOLog ("NATIVE_UFS_VERIFY allocate window=%s bytes=%llu records=%llu table=%llu\n",
+         label, bytes, blockCount, blockCount * 32);
   if (kmem_alloc (kernel_map, &verifiedStorage, verifiedStorageBytes,
                   static_cast<kma_flags_t> (KMA_KOBJECT | KMA_DATA), VM_KERN_MEMORY_SECURITY) != KERN_SUCCESS) {
     return false;
   }
   memcpy (reinterpret_cast<void *> (verifiedStorage), manifest, manifestBytes);
+  uint8_t *hashes = reinterpret_cast<uint8_t *> (
+    verifiedStorage + VR_HEADER_BYTES + VR_SIGNATURE_BYTES
+  );
   uint8_t *key = reinterpret_cast<uint8_t *> (verifiedStorage + tableBytes);
   memcpy (key, verified_root_key, VR_KEY_BYTES);
+  uint8_t tableDigest[32];
+  if (!vr_xnu_crypto.sha256 (hashes, static_cast<size_t> (blockCount * 32), tableDigest) ||
+      !equalDigest (tableDigest, manifest + 88, sizeof (tableDigest))) {
+    gRootDiagnostic.stage = "embedded hash table";
+    gRootDiagnostic.verify = VR_HASH_TABLE;
+    return false;
+  }
+
   gRootDiagnostic.stage = "policy read-only protection";
   if (vm_map_protect (kernel_map, verifiedStorage, verifiedStorage + verifiedStorageBytes,
                       VM_PROT_READ, TRUE) != KERN_SUCCESS) {
     return false;
   }
-  gRootDiagnostic.stage = "owner signature and hash table";
-  int status = vr_open (reinterpret_cast<const uint8_t *> (verifiedStorage), manifestBytes, key, 1,
-                        &vr_xnu_crypto, &verified);
-  gRootDiagnostic.verify = static_cast<uint32_t> (status);
-  return status == VR_OK && verified.image_bytes == bytes;
+  verified.hashes = hashes;
+  verified.image_bytes = bytes;
+  verified.block_count = blockCount;
+  verified.generation = le64 (manifest + 152);
+  memcpy (verified.volume_uuid, manifest + 40, sizeof (verified.volume_uuid));
+  memcpy (verified.image_sha256, manifest + 56, sizeof (verified.image_sha256));
+  verifiedRecordBytes = kEmbeddedAuthRecordBytes;
+  IOLog ("NATIVE_UFS_VERIFY embedded window=%s records=%llu record_bytes=%u table=%llu table_sha256=%02x%02x%02x%02x\n",
+         label, blockCount, verifiedRecordBytes, blockCount * 32,
+         tableDigest[0], tableDigest[1], tableDigest[2], tableDigest[3]);
+  return true;
 }
 
 bool NativeUfsBlock::authenticatesVolume (const char *uuid, uint8_t *manifestDigest) const
@@ -1526,6 +1683,101 @@ extern "C" int native_ufs_block_authenticates (IOService *provider, const char *
   }
   return block->authenticatesVolume (uuid, digest) ? 1 : 0;
 }
+
+// Resolve the dev_t XNU mounted as its root back through the IORegistry to
+// the NativeUfs window that owns it. The UUID check binds that media to the
+// owner-signed manifest; the provider walk prevents an unrelated IOMedia from
+// claiming the same UUID. Exactly one IOMedia must match the BSD device.
+extern "C" int native_verified_block_root_authorized (dev_t device)
+{
+  if (device == NODEV) {
+    IOLog ("NATIVE_OWNER_TRUST device=invalid result=0\n");
+    return 0;
+  }
+
+  const unsigned majorNumber = major (static_cast<uint32_t> (device));
+  const unsigned minorNumber = minor (static_cast<uint32_t> (device));
+  OSDictionary *matching = IOService::serviceMatching ("IOMedia");
+  OSDictionary *properties = OSDictionary::withCapacity (2);
+  OSNumber *majorValue = OSNumber::withNumber (majorNumber, 32);
+  OSNumber *minorValue = OSNumber::withNumber (minorNumber, 32);
+  if (!matching || !properties || !majorValue || !minorValue) {
+    OSSafeReleaseNULL (minorValue);
+    OSSafeReleaseNULL (majorValue);
+    OSSafeReleaseNULL (properties);
+    OSSafeReleaseNULL (matching);
+    IOLog ("NATIVE_OWNER_TRUST device=%x allocation=0\n",
+           static_cast<unsigned> (device));
+    return 0;
+  }
+
+  bool ready = properties->setObject (kIOBSDMajorKey, majorValue) &&
+               properties->setObject (kIOBSDMinorKey, minorValue) &&
+               matching->setObject ("IOPropertyMatch", properties);
+  OSSafeReleaseNULL (minorValue);
+  OSSafeReleaseNULL (majorValue);
+  OSSafeReleaseNULL (properties);
+  OSIterator *iterator = ready ? IOService::getMatchingServices (matching) : nullptr;
+  OSSafeReleaseNULL (matching);
+  if (!iterator) {
+    IOLog ("NATIVE_OWNER_TRUST device=%x iterator=0\n",
+           static_cast<unsigned> (device));
+    return 0;
+  }
+
+  unsigned matches = 0;
+  unsigned depth = 0;
+  int result = 0;
+  char uuidText[37] = {};
+  const char *providerClass = "-";
+  while (OSObject *object = iterator->getNextObject ()) {
+    IOService *media = OSDynamicCast (IOService, object);
+    if (!media) {
+      continue;
+    }
+    if (++matches != 1) {
+      result = 0;
+      break;
+    }
+
+    OSString *uuid = OSDynamicCast (OSString, media->getProperty ("UUID"));
+    if (!uuid || uuid->getLength () != 36) {
+      IOLog ("NATIVE_OWNER_TRUST device=%x media_uuid=invalid result=0\n",
+             static_cast<unsigned> (device));
+      continue;
+    }
+    strlcpy (uuidText, uuid->getCStringNoCopy (), sizeof (uuidText));
+
+    for (IOService *provider = media; provider && depth < 64; provider = provider->getProvider ()) {
+      ++depth;
+      NativeUfsBlock *block = OSDynamicCast (NativeUfsBlock, provider);
+      if (!block) {
+        continue;
+      }
+      providerClass = provider->getMetaClass () ? provider->getMetaClass ()->getClassName () : "NativeUfsBlock";
+      result = block->authenticatesVolume (uuidText) ? 1 : 0;
+      char wrongUuid[37];
+      strlcpy (wrongUuid, uuidText, sizeof (wrongUuid));
+      wrongUuid[0] ^= 1;
+      int wrongResult = block->authenticatesVolume (wrongUuid) ? 1 : 0;
+      IOLog ("NATIVE_OWNER_TRUST device=%x uuid=%s provider=%s depth=%u result=%d wrong_uuid=%d\n",
+             static_cast<unsigned> (device), uuidText, providerClass, depth, result, wrongResult);
+      break;
+    }
+  }
+  iterator->release ();
+
+  if (matches != 1) {
+    IOLog ("NATIVE_OWNER_TRUST device=%x media_matches=%u depth=%u result=0\n",
+           static_cast<unsigned> (device), matches, depth);
+    return 0;
+  }
+  if (!result) {
+    IOLog ("NATIVE_OWNER_TRUST device=%x uuid=%s provider=%s depth=%u result=0\n",
+           static_cast<unsigned> (device), uuidText, providerClass, depth);
+  }
+  return result;
+}
 #endif
 
 bool NativeUfsBlock::start (IOService *provider)
@@ -1556,6 +1808,7 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     IOMemoryDescriptor *buffer;
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
     const vr_view *view;
+    uint32_t recordBytes;
 #endif
     void lock () { IOLockLock (mutex); }
     void unlock () { IOLockUnlock (mutex); }
@@ -1572,11 +1825,13 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     IOReturn verify (uint64_t index, const void *data, size_t length) {
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
       uint64_t t0 = timerTicks ();
-      int status = vr_verify_block (view, index, data, length, &vr_xnu_crypto);
+      bool verifiedRecord = verifyEmbeddedRecord (
+        view, recordBytes, index, data, length
+      );
       __atomic_fetch_add (&native_ufs_verify_ticks, timerTicks () - t0, __ATOMIC_RELAXED);
-      if (status != VR_OK) {
+      if (!verifiedRecord) {
         gRootDiagnostic.stage = "read block integrity";
-        gRootDiagnostic.verify = static_cast<uint32_t> (status);
+        gRootDiagnostic.verify = VR_BLOCK;
         __atomic_fetch_add (&native_ufs_integrity_failures, 1, __ATOMIC_RELAXED);
         return kIOReturnNotPrivileged;
       }
@@ -1594,10 +1849,16 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     }
   } operations = { windowLock, buffer
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
-    , &verified
+    , &verified, verifiedRecordBytes
 #endif
   };
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+  UfsWindowResult outcome = ufsReadVerifiedRecords (
+    operations, absolute, bytes, block, count, bounce, verifiedRecordBytes
+  );
+#else
   UfsWindowResult outcome = ufsReadWindow (operations, absolute, bytes, block, count, bounce);
+#endif
   IOReturn result = outcome.status;
   uint64_t done = outcome.done;
   if (result != kIOReturnSuccess) {
@@ -1637,6 +1898,8 @@ static bool gPendingAttached[4];
 static char gPendingUuid[4][37];
 static UfsRootPlan gPublicationPlan;
 static NativeUfs *gPendingProvider;
+static NativeUfs *gDeferredRootOwner;
+static IOService *gDeferredRootProvider;
 
 static bool mediaWithUuidExists (const char *uuid, NativeUfsBlock *window)
 {
@@ -1724,7 +1987,7 @@ static void publishThread (void *, wait_result_t)
       for (unsigned tick = 0; tick <= 300; ++tick) {
         ready = mediaWithUuidExists (uuid, device);
         if (ready || tick == 300) break;
-        IOSleep (100);
+        if (!waitTimebaseMillisecondsWithYield (100)) break;
       }
       IOLog ("NativeUfs: %s volume %s %s\n", device->windowLabel (), uuid, ready ? "ready" : "not ready");
       if (!ready) captureMissingMedia (uuid);
@@ -1792,9 +2055,9 @@ static void mediaReportThread (void *, wait_result_t)
     if (count >= 4) {
       break;
     }
-    IOSleep (100);
+    if (!waitTimebaseMillisecondsWithYield (100)) break;
   }
-  IOSleep (500);
+  waitTimebaseMillisecondsWithYield (500);
   int used = snprintf (gMediaReport, sizeof (gMediaReport),
                        "NATIVE_UFS media report: published=%u reads=%llu failures=%llu media=%u\n",
                        native_ufs_blocks_published, native_ufs_block_reads, native_ufs_block_failures, count);
@@ -1820,6 +2083,44 @@ static void mediaReportThread (void *, wait_result_t)
     matching->release ();
   }
   panic ("%s", gMediaReport);
+}
+
+void NativeUfs::deferredRootStart (void *, wait_result_t)
+{
+  unsigned delay = 5, delayYield = 1;
+  PE_parse_boot_argn ("native-ufs-start-delay", &delay, sizeof (delay));
+  PE_parse_boot_argn ("native-ufs-delay-yield", &delayYield, sizeof (delayYield));
+  IOLog ("NATIVE_UFS_DEFER waiting=%us mode=%s\n",
+         delay, delayYield ? "timebase-yield" : "blocking");
+  bool waitSucceeded = true;
+  if (delayYield) {
+    waitSucceeded = waitTimebaseSecondsWithYield (delay);
+  } else {
+    IOSleep (delay * 1000);
+  }
+  if (!waitSucceeded) {
+    IOLog ("NATIVE_UFS_DEFER timebase unavailable; root start skipped\n");
+    gDeferredRootProvider->release ();
+    gDeferredRootOwner->release ();
+    gDeferredRootProvider = nullptr;
+    gDeferredRootOwner = nullptr;
+    return;
+  }
+  IOLog ("NATIVE_UFS_DEFER awake; root probe begins after CDC initialization\n");
+  bool published = gDeferredRootOwner->startRoot (gDeferredRootProvider);
+  if (!published) {
+    panic ("NATIVE_UFS media report: root start failed after CDC (blocks=%u)",
+           native_ufs_blocks_published);
+  }
+  thread_t thread = nullptr;
+  if (kernel_thread_start (mediaReportThread, nullptr, &thread) != KERN_SUCCESS) {
+    panic ("NATIVE_UFS media report: cannot start the report thread");
+  }
+  thread_deallocate (thread);
+  gDeferredRootProvider->release ();
+  gDeferredRootOwner->release ();
+  gDeferredRootProvider = nullptr;
+  gDeferredRootOwner = nullptr;
 }
 
 bool NativeUfs::start (IOService *provider)
@@ -1932,15 +2233,22 @@ bool NativeUfs::start (IOService *provider)
     return true;
   }
   if (probe == 12) {
-    bool published = startRoot (provider);
-    if (!published) {
-      panic ("NATIVE_UFS media report: root start failed (blocks=%u)", native_ufs_blocks_published);
-    }
+    // bsd_init starts the CDC console before it waits for the root. Deferring
+    // this diagnostic path keeps every UFS checkpoint on a live USB channel.
+    gDeferredRootOwner = this;
+    gDeferredRootProvider = provider;
+    retain ();
+    provider->retain ();
     thread_t thread = nullptr;
-    if (kernel_thread_start (mediaReportThread, nullptr, &thread) != KERN_SUCCESS) {
-      panic ("NATIVE_UFS media report: cannot start the report thread");
+    if (kernel_thread_start (deferredRootStart, nullptr, &thread) != KERN_SUCCESS) {
+      provider->release ();
+      release ();
+      gDeferredRootProvider = nullptr;
+      gDeferredRootOwner = nullptr;
+      panic ("NATIVE_UFS media report: cannot start the deferred root thread");
     }
     thread_deallocate (thread);
+    IOLog ("NATIVE_UFS_DEFER scheduled\n");
     return true;
   }
   if (rootMode && !probe) {
@@ -2001,15 +2309,21 @@ bool NativeUfs::startRoot (IOService *provider)
       gRootDiagnostic.publicationPhase = static_cast<unsigned> (UfsRootPhase::Prepare);
       gRootDiagnostic.publicationWindow = index;
       gRootDiagnostic.windowBytes = layout->window[index].size;
+      IOLog ("NATIVE_UFS_PUBLISH allocate window=%u offset=%llx size=%llx\n",
+             index, layout->window[index].offset, layout->window[index].size);
       NativeUfsBlock *device = OSTypeAlloc (NativeUfsBlock);
+      IOLog ("NATIVE_UFS_PUBLISH allocate window=%u device=%p\n", index, device);
       gPendingDevice[index] = device;
       gPendingAttached[index] = false;
       gPendingUuid[index][0] = 0;
       uint64_t absolute = layout->userdataFirst * 4096ULL + layout->window[index].offset;
       if (!device || !device->init (static_cast<OSDictionary *> (nullptr)) ||
           !device->configure (layout->window[index].name, absolute, layout->window[index].size)) return false;
+      IOLog ("NATIVE_UFS_PUBLISH configured window=%u name=%s\n",
+             index, layout->window[index].name);
       gRootDiagnostic.stage = "root window attachment";
       if (!device->attach (owner)) return false;
+      IOLog ("NATIVE_UFS_PUBLISH attached window=%u\n", index);
       gPendingAttached[index] = true;
       ++gPending;
       gRootDiagnostic.prepared = gPending;
