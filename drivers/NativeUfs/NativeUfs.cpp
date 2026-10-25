@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Native sheng SM8550 UFS bring-up. Default-off: no MMIO is touched unless
-// native-ufs-probe=1 is present. This is a register probe, not a storage driver.
+// Native UFS bring-up derived from sheng's SM8550 implementation. Hardware
+// access stays off unless a native-ufs boot argument requests it; requested
+// modes can inspect, diagnose, or publish the root block-device windows.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/storage/IOBlockStorageDevice.h>
@@ -109,10 +110,20 @@ static bool contains (const char *data, size_t length, const char *needle)
 IOService *NativeUfs::probe (IOService *provider, SInt32 *score)
 {
   native_ufs_probe_calls = native_ufs_probe_calls + 1;
+  const char *providerName = provider ? provider->getName () : "(null)";
+  const char *providerClass = provider && provider->getMetaClass ()
+      ? provider->getMetaClass ()->getClassName () : "(null)";
+  if (native_ufs_probe_calls <= 8) {
+    IOLog ("NATIVE_UFS_PROBE enter seq=%u provider=%s class=%s compatible=%u\n",
+           native_ufs_probe_calls, providerName, providerClass,
+           provider && provider->getProperty ("compatible") ? 1U : 0U);
+  }
   if (OSDynamicCast (IOPlatformExpertDevice, provider)) {
     // Second personality (KernelConfigTables: IOMatchCategory NativeUfsRoot): attaches to the
     // root device, which starts before the platform expert publishes IOResources, so the
     // hardware probes run before the original AMFI (whose start panics without a PMGR).
+    IOLog ("NATIVE_UFS_PROBE root provider=%s class=%s calls=%u\n",
+           providerName, providerClass, native_ufs_probe_calls);
     native_ufs_matched = 1;
     if (score) {
       *score = 500;
@@ -135,6 +146,8 @@ IOService *NativeUfs::probe (IOService *provider, SInt32 *score)
   if (!match) {
     return nullptr;
   }
+  IOLog ("NATIVE_UFS_PROBE ufshc provider=%s class=%s calls=%u\n",
+         providerName, providerClass, native_ufs_probe_calls);
   native_ufs_matched = 1;
   if (score) {
     *score = 1000;
@@ -287,7 +300,20 @@ static void smmuBypassStream (uint16_t stream, OSSharedPtr<IOMemoryMap> &keep, u
   if (!smmu) {
     panic ("NATIVE_UFS smmu: map failed");
   }
-  UfsSmmuPlan plan = planUfsSmmu (stream, dma, bytes, [smmu](unsigned offset) { return read32 (smmu, offset); });
+  if (gRootDiagnosticEnabled) {
+    IOLog ("NATIVE_UFS_SMMU mapped=%p plan=begin\n", (void *) smmu);
+  }
+  auto traceRead = [smmu](unsigned offset) {
+    if (gRootDiagnosticEnabled) {
+      IOLog ("NATIVE_UFS_SMMU read=%x\n", offset);
+    }
+    return read32 (smmu, offset);
+  };
+  UfsSmmuPlan plan = planUfsSmmu (stream, dma, bytes, traceRead);
+  if (gRootDiagnosticEnabled) {
+    IOLog ("NATIVE_UFS_SMMU plan=end error=%s slot=%x bank=%u\n",
+           plan.error ? plan.error : "none", plan.slot, plan.bank);
+  }
   gRootDiagnostic.smmuId1 = read32 (smmu, 0x24);
   gRootDiagnostic.smmuId2 = read32 (smmu, 0x28);
   gRootDiagnostic.smmuSlot = plan.slot;
@@ -300,9 +326,15 @@ static void smmuBypassStream (uint16_t stream, OSSharedPtr<IOMemoryMap> &keep, u
   }
   unsigned bank = plan.bank, index = plan.slot;
   uintptr_t cb = smmu + (plan.pages + bank) * 4096;
+  if (gRootDiagnosticEnabled) {
+    IOLog ("NATIVE_UFS_SMMU configure=begin slot=%u bank=%u\n", index, bank);
+  }
   const char *failure = configureUfsSmmu (plan, stream,
-    [smmu](unsigned offset) { return read32 (smmu, offset); },
+    traceRead,
     [smmu](unsigned offset, uint32_t value) {
+      if (gRootDiagnosticEnabled) {
+        IOLog ("NATIVE_UFS_SMMU write=%x value=%x\n", offset, value);
+      }
       write32 (smmu, offset, value);
       __asm__ volatile ("dsb sy" ::: "memory");
     });
@@ -318,6 +350,10 @@ static void smmuBypassStream (uint16_t stream, OSSharedPtr<IOMemoryMap> &keep, u
     rootDiagnosticFailure (failure);
     panic ("NATIVE_UFS smmu: %s idx=%u bank=%u cba2r=%x", failure, index, bank,
            gRootDiagnostic.cba2r);
+  }
+  if (gRootDiagnosticEnabled) {
+    IOLog ("NATIVE_UFS_SMMU configure=end smr=%x s2cr=%x cbar=%x sctlr=%x\n",
+           smr, s2cr, cbar, sctlr);
   }
   report[0] = index | (bank << 16);
   report[1] = cbar;
@@ -885,6 +921,10 @@ static void hostWrite (unsigned offset, uint32_t value)
 // `why` receives a short reason on failure.
 static bool hostBringUp (const char **why)
 {
+  if (gRootDiagnosticEnabled) {
+    IOLog ("NATIVE_UFS_BRINGUP begin poisoned=%u ready=%u\n",
+           gHost.poisoned, gHost.ready);
+  }
   if (gHost.poisoned) {
     *why = "transport quarantined";
     return false;
@@ -893,18 +933,31 @@ static bool hostBringUp (const char **why)
     return true;
   }
   gRootDiagnostic.stage = "controller map";
+  if (gRootDiagnosticEnabled) {
+    IOLog ("NATIVE_UFS_BRINGUP controller_map=begin\n");
+  }
   gHost.hc = mapPhys (UFS_HC_BASE, UFS_HC_SIZE, gHost.hcMap);
   if (!gHost.hc) {
     *why = "controller map";
     return false;
   }
   if (gRootDiagnosticEnabled) {
+    IOLog ("NATIVE_UFS_BRINGUP controller_map=end hc=%p\n", (void *) gHost.hc);
+  }
+  if (gRootDiagnosticEnabled) {
     gRootDiagnostic.cap = read32 (gHost.hc, 0x00);
+    IOLog ("NATIVE_UFS_BRINGUP cap=%x\n", gRootDiagnostic.cap);
     gRootDiagnostic.version = read32 (gHost.hc, 0x08);
+    IOLog ("NATIVE_UFS_BRINGUP version=%x\n", gRootDiagnostic.version);
     gRootDiagnostic.hcs = read32 (gHost.hc, 0x30);
+    IOLog ("NATIVE_UFS_BRINGUP hcs=%x\n", gRootDiagnostic.hcs);
     gRootDiagnostic.hce = read32 (gHost.hc, 0x34);
+    IOLog ("NATIVE_UFS_BRINGUP hce=%x\n", gRootDiagnostic.hce);
   }
   gRootDiagnostic.stage = "DMA allocation";
+  if (gRootDiagnosticEnabled) {
+    IOLog ("NATIVE_UFS_BRINGUP dma=begin\n");
+  }
   gHost.dma = IOBufferMemoryDescriptor::inTaskWithOptions (
     kernel_task, static_cast<IOOptionBits> (kIODirectionInOut) | static_cast<IOOptionBits> (kIOMemoryPhysicallyContiguous) |
     static_cast<IOOptionBits> (kIOMemoryMapperNone),
@@ -913,6 +966,9 @@ static bool hostBringUp (const char **why)
   if (!gHost.dma || !gHost.lock) {
     *why = "dma buffer";
     return false;
+  }
+  if (gRootDiagnosticEnabled) {
+    IOLog ("NATIVE_UFS_BRINGUP dma=end\n");
   }
   gHost.virt = static_cast<uint8_t *> (gHost.dma->getBytesNoCopy ());
   IOByteCount contiguous = 0;
@@ -924,12 +980,27 @@ static bool hostBringUp (const char **why)
     *why = "DMA address/contiguity";
     return false;
   }
+  if (gRootDiagnosticEnabled) {
+    IOLog ("NATIVE_UFS_BRINGUP dma phys=%llx bytes=%llx\n", gHost.phys, contiguous);
+  }
   bzero (gHost.virt, kDmaBytes);
   cacheCivac (gHost.virt, kDmaBytes);
   uint32_t report[3] = { 0, 0, 0 };
   gRootDiagnostic.stage = "SMMU and request list";
+  if (gRootDiagnosticEnabled) {
+    IOLog ("NATIVE_UFS_BRINGUP stop_queue=begin\n");
+  }
   if (!hostStopQueue (why)) return false;
+  if (gRootDiagnosticEnabled) {
+    IOLog ("NATIVE_UFS_BRINGUP stop_queue=end\n");
+  }
+  if (gRootDiagnosticEnabled) {
+    IOLog ("NATIVE_UFS_BRINGUP smmu=begin\n");
+  }
   smmuBypassStream (0x60, gHost.smmuMap, report, gHost.phys, kDmaBytes);
+  if (gRootDiagnosticEnabled) {
+    IOLog ("NATIVE_UFS_BRINGUP smmu=end\n");
+  }
   gHost.smmu = gHost.smmuMap->getVirtualAddress ();
   uint32_t idr1 = read32 (gHost.smmu, 0x24);
   gHost.cb = gHost.smmu + ((1U << (((idr1 >> 28) & 7) + 1)) + (report[0] >> 16)) * 4096;
@@ -939,7 +1010,13 @@ static bool hostBringUp (const char **why)
     gRootDiagnostic.smmuId2 = read32 (gHost.smmu, 0x28);
     gRootDiagnostic.cba2r = read32 (gHost.smmu, 0x1800 + 4 * (report[0] >> 16));
   }
+  if (gRootDiagnosticEnabled) {
+    IOLog ("NATIVE_UFS_BRINGUP start_queue=begin\n");
+  }
   if (!hostStartQueue (why)) return false;
+  if (gRootDiagnosticEnabled) {
+    IOLog ("NATIVE_UFS_BRINGUP start_queue=end\n");
+  }
   gRootDiagnostic.stage = "NOP OUT";
   // NOP OUT proves the transport before touching the SCSI layer.
   if (hostNop () != kIOReturnSuccess) {
@@ -947,12 +1024,18 @@ static bool hostBringUp (const char **why)
     *why = "NOP OUT";
     return false;
   }
+  if (gRootDiagnosticEnabled) {
+    IOLog ("NATIVE_UFS_BRINGUP nop=ok\n");
+  }
   uint32_t power = 0;
   gRootDiagnostic.stage = "power mode query";
   if (hostQueryRead (0x03, 0x02, &power) != kIOReturnSuccess) {
     gHost.ready = false;
     *why = "power mode query";
     return false;
+  }
+  if (gRootDiagnosticEnabled) {
+    IOLog ("NATIVE_UFS_BRINGUP power=%x\n", power);
   }
   gRootDiagnostic.power = power;
   if ((power & 0xff) != 0x11) {
@@ -968,11 +1051,17 @@ static bool hostBringUp (const char **why)
     IOSleep (50);
   }
   gRootDiagnostic.stage = "LUN ready";
+  if (gRootDiagnosticEnabled) {
+    IOLog ("NATIVE_UFS_BRINGUP lun_ready=begin\n");
+  }
   for (unsigned attempt = 0; attempt < 20; attempt++) {
     uint8_t tur[6] = { 0, 0, 0, 0, 0, 0 };
     uint32_t scsi = 0;
     if (hostScsi (0, tur, 6, false, 0, 200000, &scsi) == kIOReturnSuccess) {
       gHost.ready = true;
+      if (gRootDiagnosticEnabled) {
+        IOLog ("NATIVE_UFS_BRINGUP lun_ready=ok attempt=%u\n", attempt);
+      }
       return true;
     }
     if (gHost.poisoned) break;
@@ -1739,11 +1828,19 @@ bool NativeUfs::start (IOService *provider)
   PE_parse_boot_argn ("native-ufs-probe", &probe, sizeof (probe));
   PE_parse_boot_argn ("native-ufs-root", &rootMode, sizeof (rootMode));
   native_ufs_probe_requested = probe != 0;
+  const bool rootProvider = OSDynamicCast (IOPlatformExpertDevice, provider) != nullptr;
+  IOLog ("NATIVE_UFS_START provider=%s class=%s probe=%u root=%u root_provider=%u\n",
+         provider ? provider->getName () : "(null)",
+         provider && provider->getMetaClass () ? provider->getMetaClass ()->getClassName () : "(null)",
+         probe, rootMode, rootProvider);
   // Default: match for observability only, never touch the controller. Hardware work runs once,
   // from the root-device personality; the ufshc nub match stays observation-only.
-  if ((!probe && !rootMode) || !OSDynamicCast (IOPlatformExpertDevice, provider)) {
+  if ((!probe && !rootMode) || !rootProvider) {
+    IOLog ("NATIVE_UFS_START rejected request=%u root_provider=%u\n",
+           probe != 0 || rootMode != 0, rootProvider);
     return false;
   }
+  IOLog ("NATIVE_UFS_START accepted probe=%u root=%u\n", probe, rootMode);
   unsigned diagnostic = 0;
   PE_parse_boot_argn ("native-ufs-diagnostics", &diagnostic, sizeof (diagnostic));
   gRootDiagnosticEnabled = diagnostic == 1;
@@ -1856,6 +1953,7 @@ bool NativeUfs::start (IOService *provider)
 bool NativeUfs::startRoot (IOService *provider)
 {
   const char *why = "";
+  IOLog ("NATIVE_UFS_START root path entered\n");
   native_ufs_root_step = 1;
   if (!hostBringUp (&why)) {
     rootDiagnosticFailure (why);
