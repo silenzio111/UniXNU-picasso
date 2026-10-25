@@ -46,6 +46,7 @@ Its host-side build tooling and drivers are merged here:
 | `drivers/ArmCpu/` | Upstream ArmCpu `1951cc84` plus a `/arm-io/intc/virtual-timer-intid` override (validated little-endian u32 PPI, 16..31; absent keeps upstream's 27) and the SPI attach helper. |
 | `scripts/make-picasso-adt.py` | Adds `/arm-io/serial` (GENI UART 0x988000), `/pram` panic-log region, absolute `reg` values under a DRAM `ranges`, UFS and UFS-PHY `reg`s, and the Adreno/GMU/SMMU nodes. Each new node is inert unless the board asks for it. |
 | `scripts/dump-picasso-panic.py` | Host-side reader for the `0x46554E4B` panic header over fastboot / adb. |
+| `scripts/run-picasso-fastboot-test.py` | One-command, `fastboot boot`-only test: captures CDC, waits for automatic return to Fastboot, and archives hashes, command output and logs. |
 | `scripts/derive-a620-hwinit.py` | Derives the A620 hw_init register table from the pinned a6xx sources; needs `.cache/adreno-source`, so it is not part of the CI build. |
 | `patches/unixnu-source-kernel.patch` | Rebuilt on the new pin: guards the `native_legacy_display_probe` call with `XNU_NATIVE_LEGACY_DISPLAY` (instead of the earlier no-op stub, which would collide with the archive's definition once legacy display is enabled) and adds the `XNU_CRYPTO_BOOTSTRAP="source"` prelink bypass. |
 

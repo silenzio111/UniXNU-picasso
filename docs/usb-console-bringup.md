@@ -23,6 +23,21 @@ opened and no kernel log was collected. The script writes a binary-safe log unde
 also mirrors received bytes to the terminal. Choose `--port` when more than
 one matching device is connected; use `--output PATH` to select a log path.
 
+For a panic image that resets back to Fastboot, use the host-side orchestrator:
+
+```sh
+python3 scripts/run-picasso-fastboot-test.py \
+  --serial 52cc791d \
+  --boot-image /path/to/boot.img \
+  --expect-sha256 <sha256> \
+  --require-log-regex 'panic|NATIVE_UFS'
+```
+
+It refuses a non-Picasso or userspace-Fastboot target, starts the CDC capture,
+uses only `fastboot boot`, waits for the device to leave and return to
+Fastboot, then writes `metadata.json`, `SHA256SUMS`, the exact image, and the
+kernel log under an evidence directory. It never flashes, erases, or formats.
+
 ## Verification boundary
 
 Local verification covers patch propagation, XNU compilation, payload and
