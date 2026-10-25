@@ -126,14 +126,39 @@ Proven hold image:
 SHA-256 7f4840558755ea6e883ba93961ec92f0871adaf0e964682f523ebd3b1f004f08
 ```
 
-Next live-poll image (not yet hardware-tested):
+The first live-poll image was not sufficient. It handed control to a kernel
+thread immediately after CDC configuration, before the host had opened the tty;
+the host enumerated a CDC device but captured no log bytes. This was an event
+handoff failure, not a DWC3 or SMMU failure.
+
+The corrected live image tracks `SET_CONTROL_LINE_STATE`, keeps the synchronous
+poller active until the host opens the port, drains for another 500 ms, and uses
+an atomic lock so console-driven and kernel-thread polling never consume the
+DWC3 event ring concurrently. Console output now drives `ud_poll()` even when
+the early kernel thread is not yet schedulable.
+
+Verified live image (2026-10-25, 22:18 CST):
 
 ```text
-/Users/silenzio/Desktop/development/ios/picasso-diagnostics/20261025-usb-console/boot/boot-live-poller.img
-SHA-256 587b0f839dbd14d5e767c7c1e7c6f237797d2627ec01548d4b7d0f77f407314b
+/tmp/picasso-usb-console-driven-20261025-2215/picasso/boot/boot.img
+SHA-256 3d2d44853adb2c72db950b02cb1fc28d23423027fac3d0b033f094d0f58d1415
 ```
 
-The board defaults now enable the console without holding boot. For diagnostic
-runs that need to park at `bsd_init`, append `picasso_usb_hold=1`.
+The temporary `fastboot boot` captured 25,313 bytes (603 lines), beginning with
+the Darwin banner. It includes both SMMU guard passes, CDC enumeration,
+`live handoff configured=1 host_open=1 after 258 ms`, and continued output after
+`background poller started`. The last line was:
+
+```text
+Waiting on <dict ID="0"><key>IOProviderClass</key><string ID="1">IOMedia</string><key>Content</key><string ID="2">Apple_HFS</string></dict>
+```
+
+The repeated `NativeUfs::probe fails` and missing `Apple_HFS` provider are the
+next boot blocker. USB logging is no longer on that critical path: it works with
+the kernel running past `bsd_init` and does not require a screen photo or holding
+the boot.
+
+The board defaults enable the console without holding boot. For diagnostic runs
+that need to park at `bsd_init`, append `picasso_usb_hold=1`.
 
 No partition was flashed, erased, or formatted. Use `fastboot boot` only.

@@ -12,10 +12,10 @@ index 19b4065..b22147f 100644
  
 diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
 new file mode 100644
-index 0000000..bfe7ccc
+index 0000000..e00508f
 --- /dev/null
 +++ b/bsd/dev/picasso_usb.c
-@@ -0,0 +1,1409 @@
+@@ -0,0 +1,1458 @@
 +/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 + *
 + * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -64,6 +64,7 @@ index 0000000..bfe7ccc
 +static bool pur_live;                   /* set once the TX thread streams */
 +
 +void picasso_usb_log_char(char c);
++static void picasso_usb_console_drive_poll(void);
 +
 +void
 +picasso_usb_log_char(char c)
@@ -75,6 +76,12 @@ index 0000000..bfe7ccc
 +	pur_ring.buffer[pur_ring.total & PURing_MASK] = c;
 +	pur_ring.total++;
 +	os_atomic_store(&pur_lock, 0, release);
++	/*
++	 * bsd_init still runs before early kernel threads reliably receive CPU.
++	 * Drive the DWC3 event ring from console output itself until the
++	 * background poller becomes schedulable.
++	 */
++	picasso_usb_console_drive_poll();
 +}
 +
 +static uint32_t
@@ -209,6 +216,8 @@ index 0000000..bfe7ccc
 +	bool        smmu_guard;
 +	bool        live;
 +	bool        hold;
++	bool        host_open;
++	uint32_t _Atomic poll_lock;
 +	uint64_t    tx_pos;                  /* ring reader position */
 +	uint64_t    events, chars;
 +} ud;
@@ -896,8 +905,11 @@ index 0000000..bfe7ccc
 +		} else if (req == 0x21 && type == 0xa1) {
 +			memcpy(data, ud_line_coding, sizeof(ud_line_coding));
 +			n = sizeof(ud_line_coding);
-+		} else if ((req == 0x22 || req == 0x23) && type == 0x21 && length == 0) {
-+			/* SET_CONTROL_LINE_STATE or SEND_BREAK: accepted, no device action. */
++		} else if (req == 0x22 && type == 0x21 && length == 0) {
++			/* SET_CONTROL_LINE_STATE: bit 0 tracks the host opening the port. */
++			ud.host_open = (value & 1u) != 0;
++		} else if (req == 0x23 && type == 0x21 && length == 0) {
++			/* SEND_BREAK: accepted, no device action. */
 +		} else {
 +			ok = false;
 +		}
@@ -970,6 +982,7 @@ index 0000000..bfe7ccc
 +		if (type == 1) {        /* USB reset */
 +			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
 +			ud.configured = false;
++			ud.host_open = false;
 +			ud.tx_busy = false;
 +			ud.state = EP0_SETUP;
 +			ud_start_setup();
@@ -984,6 +997,7 @@ index 0000000..bfe7ccc
 +		} else if (type == 0) {
 +			printf("PICASSO USB: disconnect\n");
 +			ud.configured = false;
++			ud.host_open = false;
 +			ud.tx_busy = false;
 +		}
 +		return;
@@ -1053,10 +1067,29 @@ index 0000000..bfe7ccc
 +}
 +
 +static void
++ud_poll_serialized(void)
++{
++	if (!os_atomic_cmpxchg(&ud.poll_lock, 0, 1, acquire)) {
++		return;
++	}
++	ud_poll();
++	os_atomic_store(&ud.poll_lock, 0, release);
++}
++
++static void
++picasso_usb_console_drive_poll(void)
++{
++	if (!pur_live || ud.hold) {
++		return;
++	}
++	ud_poll_serialized();
++}
++
++static void
 +ud_thread(void *arg __unused, wait_result_t wr __unused)
 +{
 +	for (;;) {
-+		ud_poll();
++		ud_poll_serialized();
 +		ud_sleep_ms(2);
 +	}
 +}
@@ -1071,7 +1104,7 @@ index 0000000..bfe7ccc
 +	    ud.smmu_guard ? "PASS" : "FAIL");
 +	for (;;) {
 +		if (ud.live) {
-+			ud_poll();
++			ud_poll_serialized();
 +			picasso_usb_busy_wait(1000);
 +		} else {
 +			ud_sleep_ms(1000);
@@ -1269,7 +1302,7 @@ index 0000000..bfe7ccc
 +			picasso_usb_busy_wait((sample_ms[s] - elapsed_ms) * 1000);
 +			elapsed_ms = sample_ms[s];
 +		}
-+		ud_poll();
++		ud_poll_serialized();
 +		uint32_t dsts = dwc_rd(DSTS);
 +		uint32_t dctl = dwc_rd(DCTL);
 +		uint32_t phycfg = dwc_rd(GUSB2PHYCFG0);
@@ -1288,10 +1321,26 @@ index 0000000..bfe7ccc
 +	}
 +	if (!ud.hold) {
 +		thread_t thread;
++		unsigned handoff_ms = 0;
++		while ((!ud.configured || !ud.host_open) && handoff_ms < 10000) {
++			picasso_usb_busy_wait(1000);
++			ud_poll_serialized();
++			handoff_ms++;
++		}
++		printf("PICASSO USB: live handoff configured=%u host_open=%u after %u ms\n",
++		    ud.configured ? 1u : 0u, ud.host_open ? 1u : 0u, handoff_ms);
++		ud_poll_serialized();
++		/* Let the host attach to the newly enumerated tty and drain the
++		 * early console before control returns to bsd_init. */
++		for (unsigned settle_ms = 0; settle_ms < 500; settle_ms++) {
++			picasso_usb_busy_wait(1000);
++			ud_poll_serialized();
++		}
 +		kern_return_t result = kernel_thread_start(ud_thread, NULL, &thread);
 +		if (result == KERN_SUCCESS) {
 +			thread_deallocate(thread);
 +			printf("PICASSO USB: background poller started\n");
++			ud_poll_serialized();
 +		} else {
 +			printf("PICASSO USB: background poller failed (%d)\n", result);
 +		}
