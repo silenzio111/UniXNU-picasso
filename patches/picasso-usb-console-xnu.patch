@@ -12,10 +12,10 @@ index 19b4065..b22147f 100644
  
 diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
 new file mode 100644
-index 0000000..2237fb2
+index 0000000..4cddf14
 --- /dev/null
 +++ b/bsd/dev/picasso_usb.c
-@@ -0,0 +1,2737 @@
+@@ -0,0 +1,2776 @@
 +/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 + *
 + * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -70,6 +70,7 @@ index 0000000..2237fb2
 +#define APSS_WDT_RATE_HZ    32768u
 +#define APSS_WDT_TIMEOUT_MS 15000u
 +#define APSS_WDT_FORCED_BITE 4u
++#define PICASSO_USB_CONTROL_DEFAULT_MS 60000u
 +#define PICASSO_USB_FLUSH_POLLS 64u
 +#define PICASSO_USB_FINAL_FLUSH_POLLS 8u
 +#define PICASSO_USB_FLUSH_GAP_US 100u
@@ -381,6 +382,7 @@ index 0000000..2237fb2
 +	bool        smmu_guard;
 +	bool        live;
 +	bool        hold;
++	unsigned    control_ms;
 +	bool        host_open;
 +	bool        panic_test;
 +	bool        panic_mode;
@@ -2560,6 +2562,7 @@ index 0000000..2237fb2
 +		while ((!ud.configured || !ud.host_open) && handoff_ms < 10000) {
 +			picasso_usb_busy_wait(1000);
 +			ud_poll_serialized();
++			picasso_usb_watchdog_pet();
 +			handoff_ms++;
 +			if (ud.configured &&
 +			    (handoff_ms <= 5 || handoff_ms % 1000 == 0)) {
@@ -2569,18 +2572,42 @@ index 0000000..2237fb2
 +		printf("PICASSO USB: live handoff configured=%u host_open=%u after %u ms\n",
 +		    ud.configured ? 1u : 0u, ud.host_open ? 1u : 0u, handoff_ms);
 +		ud_poll_serialized();
-+		/* Let the host attach to the newly enumerated tty and drain the
-+		 * early console before control returns to bsd_init. */
-+		for (unsigned settle_ms = 0; settle_ms < 500; settle_ms++) {
-+			picasso_usb_busy_wait(1000);
++		/*
++		 * Keep the early, synchronous control window open long enough for
++		 * the host to attach and issue commands. This path runs before the
++		 * timer-dependent background poller and UFS probe, so commands and
++		 * watchdog petting remain reliable even when those later paths hang.
++		 */
++		if (ud.control_ms != 0) {
++			printf("PICASSO USB: control window open for %u ms\n",
++			    ud.control_ms);
++			for (unsigned control_ms = 0;
++			    control_ms < ud.control_ms; control_ms++) {
++				picasso_usb_busy_wait(1000);
++				ud_poll_serialized();
++				picasso_usb_watchdog_pet();
++				if (ud.configured &&
++				    ((control_ms + 1) % 10000 == 0)) {
++					printf("PICASSO USB: control window t=%ums events=%llu rx=%llu\n",
++					    control_ms + 1, ud.events, ud.rx_bytes);
++				}
++			}
++			printf("PICASSO USB: control window complete after %u ms\n",
++			    ud.control_ms);
 +			ud_poll_serialized();
-+			if (settle_ms % 100 == 99) {
-+				ud_dump_ep_state("settle", EP_RX);
++		} else {
++			/* Preserve the old short settle when the window is disabled. */
++			for (unsigned settle_ms = 0; settle_ms < 500; settle_ms++) {
++				picasso_usb_busy_wait(1000);
++				ud_poll_serialized();
++				picasso_usb_watchdog_pet();
++				if (settle_ms % 100 == 99) {
++					ud_dump_ep_state("settle", EP_RX);
++				}
 +			}
 +		}
-+		picasso_usb_watchdog_arm();
 +		if (ud.watchdog_armed) {
-+			printf("PICASSO USB: APSS watchdog armed timeout=%u ms\n",
++			printf("PICASSO USB: APSS watchdog retained timeout=%u ms\n",
 +			    APSS_WDT_TIMEOUT_MS);
 +		}
 +		kern_return_t result = kernel_thread_start(ud_thread, NULL, &thread);
@@ -2589,8 +2616,8 @@ index 0000000..2237fb2
 +			printf("PICASSO USB: background poller started\n");
 +			ud_poll_serialized();
 +		} else {
-+			printf("PICASSO USB: background poller failed (%d)\n", result);
-+			picasso_usb_watchdog_disable();
++			printf("PICASSO USB: background poller failed (%d); watchdog will reset\n",
++			    result);
 +		}
 +	}
 +}
@@ -2604,6 +2631,7 @@ index 0000000..2237fb2
 +	int panic_test = 0;
 +	int panic_reset = 1;
 +	int watchdog = 1;
++	int control_ms = PICASSO_USB_CONTROL_DEFAULT_MS;
 +	char reset_mode[16] = "psci";
 +
 +	PE_parse_boot_argn("picasso_usb", &enabled, sizeof(enabled));
@@ -2615,10 +2643,13 @@ index 0000000..2237fb2
 +	    sizeof(panic_reset));
 +	PE_parse_boot_argn("picasso_usb_watchdog", &watchdog,
 +	    sizeof(watchdog));
++	PE_parse_boot_argn("picasso_usb_control_ms", &control_ms,
++	    sizeof(control_ms));
 +	PE_parse_boot_argn("picasso_usb_reset", reset_mode,
 +	    sizeof(reset_mode));
 +	ud.mps = 64;
 +	ud.hold = hold != 0;
++	ud.control_ms = control_ms > 0 ? (unsigned)control_ms : 0;
 +	ud.panic_test = panic_test != 0;
 +	ud.panic_reset = panic_reset != 0;
 +	ud.watchdog = watchdog != 0;
@@ -2635,6 +2666,14 @@ index 0000000..2237fb2
 +	ud.pshold = ml_io_map(PSHOLD_PA, PAGE_SIZE);
 +	ud.wdt = ml_io_map(APSS_WDT_PA, PAGE_SIZE);
 +	ud.imem = ml_io_map(IMEM_PA, PAGE_SIZE);
++	/*
++	 * Arm before any USB, SMMU or storage work.  If enumeration never
++	 * succeeds, the absent poller still returns the device to Fastboot.
++	 */
++	picasso_usb_watchdog_arm();
++	if (!ud.watchdog_armed) {
++		printf("PICASSO USB: watchdog unavailable; autonomous reset disabled\n");
++	}
 +	printf("PICASSO USB: PSHOLD mapped=%u panic-reset=%u watchdog=%u "
 +	    "mapped=%u IMEM mapped=%u reset=%u(%s)\n",
 +	    ud.pshold != 0 ? 1u : 0u, ud.panic_reset ? 1u : 0u,

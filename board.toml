@@ -191,9 +191,17 @@ kernel_args = [
   # this, the read-only guard sees zero matches and deliberately leaves the
   # controller untouched.
   "picasso_usb_smmu=6",
-  # Keep the CDC console alive for the full boot instead of dropping it when
-  # the initial host-open state is observed.
-  "picasso_usb_hold=1",
+  # Let the existing background poller service CDC traffic and watchdog pets.
+  "picasso_usb_hold=0",
+  # Keep the synchronous CDC command loop open before the timer-dependent
+  # background poller and UFS probe. This is long enough for the host tty to
+  # attach and issue status/reboot-fastboot; everything in this window pets the
+  # watchdog, and the boot continues automatically when it expires.
+  "picasso_usb_control_ms=60000",
+  # Arm the APSS watchdog before USB, SMMU and UFS work. If enumeration or a
+  # later kernel path hangs, the missing service resets the board back to the
+  # Fastboot reason armed in IMEM.
+  "picasso_usb_watchdog=1",
   # The XNU CDC panic/reset path uses PSHOLD as its final fallback and arms the
   # IMEM Fastboot reason before either panic or command reset.
   "picasso_usb_reset=pshold",
