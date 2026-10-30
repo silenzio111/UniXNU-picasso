@@ -52,3 +52,41 @@ static UfsWindowResult ufsReadWindow (Ops &ops, uint64_t absolute, uint64_t byte
   }
   return result;
 }
+
+// Embedded-table path: read and authenticate one complete record before any
+// requested subrange leaves the driver. recordBytes must fit the shared DMA
+// buffer and be a multiple of the driver's native 4-KiB transport unit.
+template <class Ops>
+static UfsWindowResult ufsReadVerifiedRecords (Ops &ops, uint64_t absolute, uint64_t bytes,
+                                               uint64_t block, uint64_t count, uint8_t *bounce,
+                                               uint32_t recordBytes)
+{
+  if (!bounce || !ufsWindowGeometry (absolute, bytes) || !recordBytes ||
+      recordBytes > kDataMax || (recordBytes & 4095) || !count ||
+      block >= bytes / 512 || count > bytes / 512 - block)
+    return { kIOReturnBadArgument, 0 };
+  UfsWindowGuard<Ops> guard (ops);
+  uint64_t start = block * 512, remaining = count * 512;
+  UfsWindowResult result = { kIOReturnSuccess, 0 };
+  while (remaining) {
+    uint64_t windowOffset = start + result.done;
+    uint64_t record = windowOffset / recordBytes;
+    uint64_t recordOffset = windowOffset - record * recordBytes;
+    uint64_t recordLength = bytes - record * recordBytes;
+    if (recordLength > recordBytes) recordLength = recordBytes;
+    uint64_t blocks = (recordLength + 4095) / 4096;
+    result.status = ops.read (absolute / 4096 + record * (recordBytes / 4096),
+                              static_cast<uint32_t> (blocks), bounce);
+    if (result.status != kIOReturnSuccess) break;
+    result.status = ops.verify (record, bounce, static_cast<size_t> (recordLength));
+    if (result.status != kIOReturnSuccess) break;
+    uint64_t usable = recordLength - recordOffset;
+    if (usable > remaining) usable = remaining;
+    uint64_t copied = ops.copy (result.done, bounce + recordOffset, usable);
+    if (copied > usable) { result.status = kIOReturnIOError; break; }
+    result.done += copied;
+    if (copied != usable) { result.status = kIOReturnIOError; break; }
+    remaining -= usable;
+  }
+  return result;
+}

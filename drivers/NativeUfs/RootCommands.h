@@ -1,13 +1,33 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Shared production command path. Included inside the root transport namespace.
 // The host harness replaces only MMIO, DMA synchronization, clock and lock primitives.
+#ifndef NATIVE_UFS_TRACE
+#define NATIVE_UFS_TRACE(...) do { if (gRootDiagnosticEnabled) IOLog(__VA_ARGS__); } while (0)
+#endif
+
 struct HardwareTransferPort {
   uint64_t deadline;
-  uint32_t doorbell () { return read32 (gHost.hc, 0x58); }
-  uint32_t interrupt () { return read32 (gHost.hc, 0x20); }
+  uint32_t tracePoll;
+  void beginPoll (uint32_t poll) {
+    tracePoll = poll;
+    if (poll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT poll=begin\n");
+  }
+  uint32_t doorbell () {
+    uint32_t value = read32 (gHost.hc, 0x58);
+    if (tracePoll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT poll invalidate0 doorbell=%x\n", value);
+    return value;
+  }
+  uint32_t interrupt () {
+    uint32_t value = read32 (gHost.hc, 0x20);
+    if (tracePoll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT poll invalidate0 interrupt=%x\n", value);
+    return value;
+  }
   uint32_t completedOcs () {
+    if (tracePoll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT poll invalidate0 ocs=begin\n");
     cacheInvalidate (gHost.virt, 64);
-    return *reinterpret_cast<volatile uint32_t *> (gHost.virt + 8) & 0xff;
+    uint32_t value = *reinterpret_cast<volatile uint32_t *> (gHost.virt + 8) & 0xff;
+    if (tracePoll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT poll invalidate0 ocs=%x\n", value);
+    return value;
   }
   bool expired () { return mach_absolute_time () >= deadline; }
   void delay () { IODelay (2); }
@@ -36,12 +56,15 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
   if (!timeoutUs || dataBytes > kDataMax || (dataBytes & 3) ||
       (dataBytes ? (direction != 1 && direction != 2) : direction != 0)) return kIOReturnBadArgument;
   if (gHost.poisoned) return kIOReturnNotReady;
-  if (read32 (gHost.hc, 0x58) != 0) {
+  uint32_t doorbell = read32 (gHost.hc, 0x58);
+  uint32_t interrupt = read32 (gHost.hc, 0x20);
+  NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT begin db=%x is=%x\n", doorbell, interrupt);
+  if (doorbell != 0) {
     gHost.poisoned = true;
     gHost.ready = false;
     return recordTransport (kIOReturnBusy, *ocs);
   }
-  if (read32 (gHost.hc, 0x20) & kUfsFatalStatus) {
+  if (interrupt & kUfsFatalStatus) {
     gHost.poisoned = true;
     gHost.ready = false;
     return recordTransport (kIOReturnIOError, *ocs);
@@ -75,13 +98,23 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
     prd[2] = 0;
     prd[3] = dataBytes - 1;
   }
+  NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT utrd=end\n");
+  NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT cache_clean=begin\n");
   cacheCivac (gHost.virt, kDataOffset + dataBytes);
+  NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT cache_clean=end\n");
   hostWrite (0x20, 1);  // Acknowledge completion only; preserve error evidence.
+  NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT is_ack=end is=%x\n", read32 (gHost.hc, 0x20));
   HardwareTransferPort port;
+  port.tracePoll = 0;
   clock_interval_to_deadline (timeoutUs, kMicrosecondScale, &port.deadline);
+  NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT doorbell=begin\n");
   hostWrite (0x58, 1);
+  NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT doorbell=end db=%x\n", read32 (gHost.hc, 0x58));
   UfsTransferPoll state;
   UfsTransferEnd end = pollUfsTransfer (port, state);
+  NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT poll=end result=%u polls=%u ocs=%x db=%x is=%x\n",
+                    static_cast<unsigned> (end), state.polls, state.ocs,
+                    state.doorbellSeen, state.interruptSeen);
   gRootDiagnostic.polls = state.polls;
   gRootDiagnostic.dbSeen = state.doorbellSeen;
   gRootDiagnostic.isSeen = state.interruptSeen;
@@ -100,6 +133,7 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
 
 static bool hostClearUcd (void)
 {
+  NATIVE_UFS_TRACE ("NATIVE_UFS_NOP clear=begin\n");
   if (gHost.poisoned) return false;
   // Check before touching the command/response area, not just before ringing.
   if (read32 (gHost.hc, 0x58) != 0) {
@@ -118,6 +152,7 @@ static bool hostClearUcd (void)
   for (unsigned index = 0; index < (kPrdtOffset + 16) / 4; index++) {
     words[index] = 0;
   }
+  NATIVE_UFS_TRACE ("NATIVE_UFS_NOP clear=end\n");
   return true;
 }
 
@@ -145,10 +180,16 @@ static IOReturn hostResponseHeader (uint8_t type, uint8_t lun, uint8_t tag)
 
 static IOReturn hostNop (void)
 {
-  if (!hostClearUcd ()) return kIOReturnNotReady;
+  NATIVE_UFS_TRACE ("NATIVE_UFS_NOP begin\n");
+  if (!hostClearUcd ()) {
+    NATIVE_UFS_TRACE ("NATIVE_UFS_NOP clear=failed\n");
+    return kIOReturnNotReady;
+  }
   gHost.virt[kUcdOffset + 3] = 1;
   uint32_t ocs = 15;
   IOReturn result = hostSubmit (0, 0, 200000, &ocs);
+  NATIVE_UFS_TRACE ("NATIVE_UFS_NOP submit_result=%x ocs=%x\n",
+                    static_cast<unsigned> (result), ocs);
   if (result != kIOReturnSuccess) return result;
   result = hostResponseHeader (0x20, 0, 1);
   if (result != kIOReturnSuccess) return result;

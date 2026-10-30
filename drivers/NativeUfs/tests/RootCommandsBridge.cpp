@@ -7,6 +7,7 @@
 #include <cassert>
 #include "../RootDiagnostics.h"
 #include "../TransferPoll.h"
+#define NATIVE_UFS_TRACE(...) ((void)0)
 using IOReturn = uint32_t;
 constexpr IOReturn kIOReturnSuccess=0, kIOReturnError=0xe00002bc,
   kIOReturnBadArgument=0xe00002c2, kIOReturnIOError=0xe00002ca,

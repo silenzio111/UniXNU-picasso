@@ -12,6 +12,7 @@ static UfsTransferEnd pollUfsTransfer(Port &port, UfsTransferPoll &state)
 {
   for (;;) {
     ++state.polls;
+    port.beginPoll(state.polls);
     uint32_t doorbell = port.doorbell();
     state.doorbellSeen |= doorbell;
     state.interruptSeen |= port.interrupt();

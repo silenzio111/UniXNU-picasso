@@ -1799,3 +1799,27 @@ index 65e52bc..0f900d5 100644
      spec = ctx.board.get('kernel', {}).get('prelink')
      if not spec:
          raise Error('board.toml has no [kernel.prelink]')
+diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
+--- a/scripts/build-xnu-4k-baseline.sh
++++ b/scripts/build-xnu-4k-baseline.sh
+@@ -257,5 +257,6 @@
+-if [ "$OWNER_ROOT_AUDIT" = 1 ] && [ "$OWNER_ROOT_PROBE" != 1 ]; then
+-  echo 'The root-binding audit requires real owner-verified block crypto' >&2
++if [ "$OWNER_ROOT_AUDIT" = 1 ] && [ "$OWNER_ROOT_PROBE" != 1 ] && \
++   [ "${XNU_NATIVE_UFS:-0}" != 1 ]; then
++  echo 'The root-binding audit requires real owner-verified block crypto (NativeUfs or VerifiedRoot)' >&2
+   exit 1
+ fi
+ OWNER_ROOT_TRUST=${XNU_OWNER_ROOT_TRUST:-0}
+@@ -263,8 +264,9 @@
+   echo 'XNU_OWNER_ROOT_TRUST must be 0 or 1' >&2
+   exit 1
+ fi
+-if [ "$OWNER_ROOT_TRUST" = 1 ] && { [ "$OWNER_ROOT_AUDIT" != 1 ] || [ "${XNU_NATIVE_VIRTIO_BLOCK:-0}" != 1 ]; }; then
+-  echo 'Owner root acceptance requires actual mounted-media binding and verified block storage' >&2
++if [ "$OWNER_ROOT_TRUST" = 1 ] && { [ "$OWNER_ROOT_AUDIT" != 1 ] || \
++    { [ "${XNU_NATIVE_VIRTIO_BLOCK:-0}" != 1 ] && [ "${XNU_NATIVE_UFS:-0}" != 1 ]; }; }; then
++  echo 'Owner root acceptance requires actual mounted-media binding and verified block storage (NativeUfs or VirtIO)' >&2
+   exit 1
+ fi
+ ADRENO_FIRMWARE_PROBE=${XNU_ADRENO_FIRMWARE_PROBE:-0}
