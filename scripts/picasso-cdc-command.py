@@ -15,7 +15,8 @@ import time
 
 
 COMMANDS = ('help', 'ping', 'status', 'panic-test', 'reset-test', 'hang-test',
-            'reboot-fastboot')
+            'start-graphics', 'register-display', 'publish-display',
+            'publish-display-start', 'reboot-fastboot')
 
 
 def serial_ports():
@@ -127,14 +128,15 @@ def write_all(fd, data, timeout):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--port', help='serial device, e.g. /dev/cu.usbmodem1101')
-    parser.add_argument('--command', required=True, choices=COMMANDS)
+    parser.add_argument('--command', required=True, metavar='COMMAND[,COMMAND...]',
+                        help='one command, or a comma-separated sequence')
     parser.add_argument('--output', type=Path,
                         help='log file (defaults to out/picasso/logs)')
     parser.add_argument('--wait', type=float, default=15,
                         help='seconds to wait for the USB modem')
     parser.add_argument('--duration', type=float, default=15,
                         help='seconds to keep capturing after sending the command')
-    parser.add_argument('--repeat', type=int, default=1,
+    parser.add_argument('--repeat', type=int, default=None,
                         help='number of times to send the command')
     parser.add_argument('--repeat-interval', type=float, default=1.0,
                         help='seconds between repeated command writes')
@@ -147,6 +149,13 @@ def main():
     parser.add_argument('--fastboot-serial',
                         help='serial that must re-enumerate in Fastboot')
     args = parser.parse_args()
+
+    commands = tuple(args.command.split(','))
+    if not commands or any(command not in COMMANDS for command in commands):
+        parser.error(f'commands must be one of: {", ".join(COMMANDS)}')
+    if len(commands) > 1 and args.repeat is not None:
+        parser.error('--repeat cannot be combined with a command sequence')
+    args.repeat = len(commands) if args.repeat is None else args.repeat
 
     if args.wait < 0:
         parser.error('--wait must be zero or greater')
@@ -185,9 +194,13 @@ def main():
 
     script_root = Path(__file__).resolve().parents[1]
     stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    command_name = (
+        'sequence' if len(commands) > 1
+        else args.command.replace('/', '-')
+    )
     output = args.output or (
         script_root / 'out/picasso/logs' /
-        f'picasso-cdc-{args.command.replace("/", "-")}-{stamp}.log'
+        f'picasso-cdc-{command_name}-{stamp}.log'
     )
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -197,7 +210,7 @@ def main():
         fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         configure_serial(fd)
         bits_before, bits_after = assert_modem_lines(fd)
-        payload = (args.command + '\r\n').encode('ascii')
+        payload = (commands[0] + '\r\n').encode('ascii')
         write_started = time.monotonic()
         written = write_all(fd, payload, args.write_timeout)
         write_elapsed = time.monotonic() - write_started
@@ -209,7 +222,7 @@ def main():
         sent = 1
         next_send = time.monotonic() + args.repeat_interval
         print(
-            f'Sent {args.command!r} to {port}: wrote={written}/{len(payload)} '
+            f'Sent {commands[0]!r} to {port}: wrote={written}/{len(payload)} '
             f'TIOCM={bits_before:#x}->{bits_after:#x} '
             f'write={write_elapsed:.6f}s tcdrain={drain_elapsed:.6f}s; '
             f'recording to {output}',
@@ -220,8 +233,10 @@ def main():
         with output.open('ab') as log:
             while time.monotonic() < deadline:
                 if sent < args.repeat and time.monotonic() >= next_send:
+                    command = commands[sent] if len(commands) > 1 else commands[0]
+                    payload = (command + '\r\n').encode('ascii')
                     written = write_all(fd, payload, args.write_timeout)
-                    print(f'Resent {args.command!r}: wrote={written}/{len(payload)}',
+                    print(f'Sent {command!r}: wrote={written}/{len(payload)}',
                           file=sys.stderr)
                     sent += 1
                     next_send = time.monotonic() + args.repeat_interval

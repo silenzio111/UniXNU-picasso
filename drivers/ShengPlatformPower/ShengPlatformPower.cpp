@@ -77,22 +77,23 @@ native_register_display_and_report(void)
     registered = true;
     return kOSReturnSuccess;
   }
-  printf("NATIVE DISPLAY REG: kmod name=%s\n", g_kernel_kmod_info.name);
-  void *handle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
-  printf("NATIVE DISPLAY REG: preModLoad handle=%p\n", handle);
-  if (!handle) {
-    return kOSReturnError;
-  }
+  /*
+   * The owned display is part of the prelinked kernel, not an independently
+   * started kext. The module pre/post hooks re-register the kernel's sysctl
+   * table (and panic on the already-used slot), so run only the C++ static
+   * initializer that constructs NativeLegacyDisplay::gMetaClass.
+   */
+  printf("NATIVE DISPLAY REG: direct static init\n");
   native_legacy_display_static_init();
-  OSReturn status = OSMetaClass::postModLoad(handle);
   const OSMetaClass *super = meta->getSuperClass();
-  printf("NATIVE DISPLAY REG: postModLoad=%d meta=%p super=%s size=%u\n",
-      status, meta, super ? super->getClassName() : "missing",
+  printf("NATIVE DISPLAY REG: static init meta=%p super=%s size=%u\n",
+      meta, super ? super->getClassName() : "missing",
       meta->getClassSize());
-  if (status == kOSReturnSuccess) {
+  if (super) {
     registered = true;
+    return kOSReturnSuccess;
   }
-  return status;
+  return kOSReturnError;
 }
 
 extern "C" kern_return_t
