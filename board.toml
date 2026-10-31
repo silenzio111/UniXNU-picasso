@@ -209,9 +209,9 @@ kernel_args = [
   # poll-delay is exonerated and only the kernel build + control/watchdog
   # magnitudes remain.
   "native-ufs-diagnostics=0",
-  # Persistent Data is qualified separately; keep the known-good volatile
-  # raw seed path while validating the host-deadman watchdog.
-  "sheng-data-persist=0",
+  # The 64 MiB volatile seed fills before launchd completes. Use the qualified
+  # 8 GiB packed seed and write changed pages through the NativeUfs store.
+  "sheng-data-persist=2",
   # r12: probe removed (single variable vs r11). The read-only snapshot runs
   # after CDC handoff and touches GICR/SMMU MMIO; r11 died at ~19 s with it,
   # v5 (no probe) survives. If r12 survives past 19 s, the probe is the
@@ -406,8 +406,9 @@ tool = "scripts/make-picasso-adt.py"
 chip_id = "7250"
 # The Data seed is a DBRDISK1 zero-page-packed image. DarwinBoot keeps the
 # packed bytes in the handoff; NativeRamBlock expands only nonzero pages and
-# backs changed pages with the persistent userdata store.
-packed_data_ramdisk = false
+# backs changed pages with the persistent userdata store. Pass
+# owner-data-8g.dbr to "unixnu build payload".
+packed_data_ramdisk = true
 # Select the authenticated OS APFS volume by its published IOMedia UUID. The
 # VerifiedRoot window identity check independently binds this UUID to the
 # owner-signed image before the block device is published.

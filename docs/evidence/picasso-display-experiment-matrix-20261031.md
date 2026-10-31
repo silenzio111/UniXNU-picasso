@@ -13,6 +13,9 @@
 | H9 | A current source relink with direct initialization boots to CDC | Direct initializer, no early graphics load | Rejected: current source relink still stops before CDC | Keep the known-good m16p kernel while repairing source-build hygiene |
 | H10 | Slot 189 is caused by a manually created `IOSurfaceRoot` | Preserve m16p except for the manual-root creation branch | Confirmed: m20f skips the panic, m20g finds the normal root and publishes the provider | Never create `IOSurfaceRoot`; defer display commands until IOBSD publishes `IOCoreSurfaceRoot` |
 | H11 | The remaining panic is a display regression | Same m20g kernel and display provider | Rejected: OwnerData reaches ENOSPC with 282 free blocks; `watchdogd` then exits and panics | Move to persistent/large Data storage |
+| H12 | Packed 8 GiB Data is the packed-handoff failure | Exact m16p ADT with only the map key changed to `PackedRAMDisk` | Rejected: m20k reaches CDC and userland with the 64 MiB packed seed | Preserve the original ADT random seed; do not combine packed and ADT-generation changes |
+| H13 | Persistent 8 GiB OwnerData removes the storage failure | Same m20f kernel/display fix, exact ADT, 8 GiB seed, `sheng-data-persist=2` | Confirmed: disk1s1 is 8 GiB with 2,090,155 free blocks; display client enters; no ENOSPC or slot 189 | Continue with the upstream native watchdog/AES work |
+| H14 | `watchdogd` exit is caused by Data exhaustion | Same m20m 8 GiB boot | Rejected: `watchdogd[97]` still exits with namespace 2 subcode 5 and no ENOSPC | Port the qualified native watchdog service and boot-stage policy |
 
 ## Known-good baseline
 

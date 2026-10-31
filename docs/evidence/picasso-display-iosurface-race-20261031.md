@@ -41,6 +41,11 @@ The display provider itself remains registered and the userland display client
 path reports success. The new blocking issue is Data capacity, not display class
 registration or IOSurface ownership.
 
+The follow-up 8 GiB packed seed with `sheng-data-persist=2` mounts as
+`disk1s1 size=0x200000000` with 2,090,155 of 2,097,152 blocks free. It removes
+the ENOSPC cascade. A later `watchdogd[97]` exit with namespace 2 / subcode 5
+still panics, so that service is the next independent integration target.
+
 ## Artifacts
 
 - m20f kernel:
