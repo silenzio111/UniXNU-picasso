@@ -109,3 +109,17 @@ negative `tx took` values or `attrlistbulk_iterator` time underflow. The
 Framebuffer method trace is still not enabled, and no swap-validation or
 CPU-copy event has appeared; CPU-pixel presentation therefore remains
 unqualified on this combined image.
+
+The userspace watchdog later panicked after 492 seconds because `audiomxd` had
+no successful checkin; `SpringBoard` had also not checked in since monitoring
+was enabled. `backboardd`, `mediaserverd`, `logd`, `thermalmonitord`,
+`runningboardd`, `CommCenter` and `configd` were still exchanging checkins.
+
+## Persistent versus volatile Data A/B
+
+A 128 MiB packed volatile Data test used the same kernel, timer, ADT, trust
+cache and display startup, with only `sheng-data-persist=0` and the seed changed.
+It reached launchd early boot and then immediately reported ENOSPC while
+`free_blocks` was still 1,586/2,000 blocks. It did not produce a display swap.
+This rejects slow persistent UFS writes as the explanation for the missing
+first frame and confirms that small volatile Data is not a useful fallback.
