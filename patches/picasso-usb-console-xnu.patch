@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..2237fb2
 --- /dev/null
 +++ b/bsd/dev/picasso_usb.c
-@@ -0,0 +1,3007 @@
+@@ -0,0 +1,3059 @@
 +/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 + *
 + * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -398,6 +398,9 @@ index 0000000..2237fb2
 +	bool        reboot_pending;
 +	bool        reset_pending;
 +	bool        hang_pending;
++	bool        start_kext_pending;
++	bool        register_pending;
++	int         publish_pending;
 +	bool        watchdog;
 +	bool        watchdog_armed;
 +	unsigned    reset_mode;
@@ -2276,7 +2279,7 @@ index 0000000..2237fb2
 +	ud.commands++;
 +	printf("PICASSO CDC: command '%s'\n", ud.cmd);
 +	if (ud_command_is(ud.cmd, "help")) {
-+		printf("PICASSO CDC: commands: help | status | panic-test | reset-test | hang-test | reboot-fastboot\n");
++		printf("PICASSO CDC: commands: help | status | panic-test | reset-test | start-graphics | register-display | publish-display | publish-display-start | hang-test | reboot-fastboot\n");
 +	} else if (ud_command_is(ud.cmd, "status")) {
 +		printf("PICASSO CDC: configured=%u host_open=%u live=%u panic=%u "
 +		    "watchdog=%u armed=%u reset=%u events=%llu tx=%llu "
@@ -2295,6 +2298,18 @@ index 0000000..2237fb2
 +		 */
 +		picasso_usb_watchdog_terminal();
 +		ud.panic_pending = true;
++	} else if (ud_command_is(ud.cmd, "start-graphics")) {
++		printf("PICASSO CDC: start-graphics requested; starting IOMobileGraphicsFamily\n");
++		ud.start_kext_pending = true;
++	} else if (ud_command_is(ud.cmd, "register-display")) {
++		printf("PICASSO CDC: register-display requested; running static init\n");
++		ud.register_pending = true;
++	} else if (ud_command_is(ud.cmd, "publish-display")) {
++		printf("PICASSO CDC: publish-display requested; allocate+init only\n");
++		ud.publish_pending = 1;
++	} else if (ud_command_is(ud.cmd, "publish-display-start")) {
++		printf("PICASSO CDC: publish-display-start requested; attach+start+register\n");
++		ud.publish_pending = 2;
 +	} else if (ud_command_is(ud.cmd, "reset-test")) {
 +		printf("PICASSO CDC: reset-test requested; draining then reset mode %u\n",
 +		    ud.reset_mode);
@@ -2437,6 +2452,43 @@ index 0000000..2237fb2
 +	bool normal = !ud.panic_mode && !ud.reboot_pending && !ud.hang_pending &&
 +	    !ud.panic_pending && !ud.reset_pending;
 +	os_atomic_store(&ud.poll_lock, 0, release);
++	if (ud.start_kext_pending && !ud.panic_mode) {
++		ud.start_kext_pending = false;
++		extern kern_return_t native_start_kext_and_report(const char *,
++		    const char *) __attribute__((weak));
++		if (native_start_kext_and_report != 0) {
++			kern_return_t result = native_start_kext_and_report(
++			    "com.apple.iokit.IOMobileGraphicsFamily",
++			    "IOMobileFramebufferLegacy");
++			printf("PICASSO CDC: start-graphics result=%d\n", result);
++		} else {
++			printf("PICASSO CDC: start-graphics helper unavailable\n");
++		}
++	}
++	if (ud.register_pending && !ud.panic_mode) {
++		ud.register_pending = false;
++		extern kern_return_t native_register_display_and_report(void)
++		    __attribute__((weak));
++		if (native_register_display_and_report != 0) {
++			kern_return_t result = native_register_display_and_report();
++			printf("PICASSO CDC: register-display result=%d\n", result);
++		} else {
++			printf("PICASSO CDC: register-display helper unavailable\n");
++		}
++	}
++	if (ud.publish_pending && !ud.panic_mode) {
++		int level = ud.publish_pending - 1;
++		ud.publish_pending = 0;
++		extern kern_return_t native_publish_display_and_report(int)
++		    __attribute__((weak));
++		if (native_publish_display_and_report != 0) {
++			kern_return_t result =
++			    native_publish_display_and_report(level);
++			printf("PICASSO CDC: publish-display result=%d\n", result);
++		} else {
++			printf("PICASSO CDC: publish-display helper unavailable\n");
++		}
++	}
 +	if (ud.reboot_pending && !ud.panic_mode) {
 +		ud.reboot_pending = false;
 +		ud_finish_reboot();

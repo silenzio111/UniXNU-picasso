@@ -69,6 +69,9 @@ archives = [
   # The archive lands in build/sheng-platform-power/libShengPlatformPower.a, the path
   # build-xnu-4k-baseline.sh force-loads when CONFIG_XNU_SHENG_PMGR=1.
   "build-picasso-pmgr.py",
+  # Owned CPU/GOP framebuffer subclass over the original Legacy family.
+  # It is entered only through the explicit CDC display commands.
+  "build-native-legacy-display.py",
 ]
 
 [kernel.prelink]
@@ -89,6 +92,10 @@ roots = [
   "com.apple.iokit.IOHIDFamily",
   # Original IOBSD-matched IOSurfaceRoot, required by graphics/media clients.
   "com.apple.iokit.IOSurface",
+  # The owned NativeLegacyDisplay subclass calls the unchanged
+  # IOMobileFramebufferLegacy implementation at its qualified original
+  # addresses. Keep that family in the same audited prelink layout.
+  "com.apple.iokit.IOMobileGraphicsFamily",
   "com.apple.iokit.IOStorageFamily",
   "com.apple.kec.Libm",
   "com.apple.kec.corecrypto",
@@ -192,6 +199,9 @@ kernel_args = [
   # every other message. Set it back to 1 only when the UFS transport itself is
   # the question.
   "native-ufs-diagnostics=0",
+  # Use the 8 GiB packed Data seed and back changed pages with the reserved
+  # NativeUfs store window at the end of userdata.
+  "sheng-data-persist=2",
   # IOKit matching trace is off for the same reason as the UFS one: it answers
   # whether a personality matched, which the earlier root and probe=12 runs have
   # already established, and it prints a very long log while doing so. Turn it
@@ -217,9 +227,32 @@ kernel_args = [
   # hold=1 parks bsd_init indefinitely for USB-only qualification; that mode
   # cannot exercise this branch's UFS/root/SystemOS path.
   "picasso_usb_hold=0",
+  # Bound the attended synchronous window while still leaving time to issue
+  # status/start-graphics/register-display/publish-display-start commands.
+  "picasso_usb_control_ms=15000",
+  # Host-gated deadman: keep the 32 s hardware watchdog petted while the host
+  # is alive, then force a Fastboot reset after 60 s of silence.
+  "picasso_usb_watchdog=1",
+  "picasso_usb_watchdog_ms=32000",
+  "picasso_usb_host_timeout_ms=60000",
+  "picasso_usb_host_boot_grace_ms=120000",
   # The XNU CDC panic/reset path uses PSHOLD as its final fallback and arms the
-  # IMEM Fastboot reason before either panic or command reset.
-  "picasso_usb_reset=pshold",
+  # IMEM Fastboot reason before either panic or command reset. The hardware
+  # watchdog path is the proven automatic Fastboot recovery route.
+  "picasso_usb_reset=watchdog",
+  # Qualified CPU/GOP display path. The family is loaded before the CDC
+  # window; registration/publication remain explicit CDC commands.
+  "offline-mobile-graphics-load=1",
+  "offline-legacy-register=1",
+  "offline-legacy-gop=1",
+  "offline-legacy-pm=1",
+  "offline-legacy-phase=4",
+  "offline-legacy-validate=1",
+  "offline-legacy-transfer=1",
+  "offline-legacy-cpu-present=1",
+  "sheng-vsync=60",
+  # State-only AppleKeyStore probe used by the display/keystore diagnostics.
+  "picasso-aks-state=1",
 ]
 # Stage-5 blind-spot instrumentation (docs/zh/guide/debugging.md 颜色条):
 # scripts/patch-xnu-entry-probe.py (ported from UniXNU-sheng; it adapts itself
@@ -314,6 +347,6 @@ root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
 # Keep the existing 256 MiB contiguous kernel window request. It is separate
 # from the original FAT ramdisk mapping above. Packed Data does not expand it:
 # only resident seed/write pages consume RAM, and peak use needs device testing.
-owned_memory_size = "0x10000000"
+owned_memory_size = "0x30000000"
 cpu_regs = "0,0x100,0x200,0x300,0x400,0x500,0x600,0x700"
 unique_chip_id = "required"

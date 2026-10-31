@@ -14,8 +14,9 @@ import termios
 import time
 
 
-COMMANDS = ('help', 'status', 'panic-test', 'reset-test', 'hang-test',
-            'reboot-fastboot')
+COMMANDS = ('help', 'status', 'panic-test', 'reset-test', 'start-graphics',
+            'register-display', 'publish-display', 'publish-display-start',
+            'hang-test', 'reboot-fastboot')
 
 
 def serial_ports():

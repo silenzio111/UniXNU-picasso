@@ -1,0 +1,56 @@
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+// Opaque ABI storage for the exact original class, not source-level access
+// to its private fields. The actual original metadata supplies its full
+// Framebuffer/Service/IOService ancestry. Only qualified base prototypes may
+// be called from source; opaque entries are original dispatch targets only.
+#pragma once
+#include <IOKit/IOService.h>
+#include <libkern/libkern.h>
+struct OriginalLegacySwapRequest;
+class IOMobileFramebufferLegacy : public IOService {
+ OSDeclareAbstractStructors(IOMobileFramebufferLegacy)
+ unsigned char originalPrivate[0x18a0-sizeof(IOService)];
+public:
+ // Both fields are qualified by the complete original slot-249 getter.
+ // This modifies this object's own mode state, never a vtable or executable.
+ void installBootDimensions(uint32_t width,uint32_t height) {
+  *reinterpret_cast<uint32_t *>(reinterpret_cast<unsigned char *>(this)+5808)=width;
+  *reinterpret_cast<uint32_t *>(reinterpret_cast<unsigned char *>(this)+5812)=height;
+ }
+ const OriginalLegacySwapRequest *pendingSwapRequest() const {
+  const OriginalLegacySwapRequest *request=nullptr;
+  memcpy(&request,reinterpret_cast<const unsigned char *>(this)+5480,sizeof(request));return request;
+ }
+ // The real normal scanout backend removes its pending head before calling
+ // slot 295. Slot 312 is a discard path (terminal state 8), not presentation.
+ // The queue is a tail queue (head at +5480, tail pointer at +5488, each request's next at +2960 and previous-link at +2968): taking the head
+ // moves the next request, if a client already queued one behind it (int-132: swap 3 arrived during swap 2's GPU copy and the old
+ // single-entry form refused to retire swap 2, so every wait on it stayed busy), up to the head. The original queue's reference
+ // moves to the current-swap slot for the original completion body.
+ bool activateOnlyPendingSwap(const OriginalLegacySwapRequest *request) {
+  auto self=reinterpret_cast<unsigned char *>(this);
+  auto bytes=reinterpret_cast<const unsigned char *>(request);
+  const void *current=nullptr,*head=nullptr,*tail=nullptr,*next=nullptr,*previous=nullptr;
+  memcpy(&current,self+5472,8);memcpy(&head,self+5480,8);memcpy(&tail,self+5488,8);
+  if(!request || current || head!=request)return false;
+  memcpy(&next,bytes+2960,8);memcpy(&previous,bytes+2968,8);
+  if(previous!=self+5480)return false;
+  if(next) {
+   const void *link=self+5480;
+   memcpy(const_cast<unsigned char *>(reinterpret_cast<const unsigned char *>(next))+2968,&link,8);
+  } else if(tail!=bytes+2960)return false;
+  memcpy(self+5472,&request,8);
+  if(next) {memcpy(self+5480,&next,8);}
+  else {const void *empty=nullptr,*emptyTail=self+5480;memcpy(self+5480,&empty,8);memcpy(self+5488,&emptyTail,8);}
+  return true;
+ }
+ void free() override;
+ bool init(OSDictionary *properties=nullptr) override;
+ IOReturn setProperties(OSObject *) override;
+ void systemWillShutdown(IOOptionBits) override;
+ IOService *probe(IOService *,SInt32 *) override;
+ bool start(IOService *) override;
+ void stop(IOService *) override;
+ IOWorkLoop *getWorkLoop() const override;
+ IOReturn newUserClient(task_t,void *,UInt32,IOUserClient **) override;
+ IOReturn setPowerState(unsigned long,IOService *) override;

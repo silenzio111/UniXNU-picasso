@@ -54,6 +54,10 @@ def main():
                         help='wait up to this many seconds for the serial port')
     parser.add_argument('--reconnect', action='store_true',
                         help='reopen the port if the device disappears and enumerates again')
+    parser.add_argument('--send', metavar='COMMAND',
+                        help='send COMMAND on the same serial handle (for example status)')
+    parser.add_argument('--send-interval', type=float, default=15,
+                        help='seconds between COMMAND writes (default: 15)')
     parser.add_argument('--list', action='store_true', help='list matching serial devices')
     parser.add_argument('--no-stdout', action='store_true', help='write only to the log file')
     args = parser.parse_args()
@@ -66,6 +70,8 @@ def main():
         parser.error('--duration must be greater than zero')
     if args.wait < 0:
         parser.error('--wait must be zero or greater')
+    if args.send_interval <= 0:
+        parser.error('--send-interval must be greater than zero')
     deadline = time.monotonic() + args.wait
     while not (os.path.exists(args.port) if args.port else ports):
         if time.monotonic() >= deadline:
@@ -118,7 +124,26 @@ def main():
                         f'(TIOCM={bits_before:#x}->{bits_after:#x}; Ctrl-C to stop)',
                         file=sys.stderr,
                     )
+                    command = ((args.send + '\r\n').encode('ascii')
+                               if args.send else None)
+                    next_send = time.monotonic() if command else None
                     while deadline is None or time.monotonic() < deadline:
+                        if command and time.monotonic() >= next_send:
+                            try:
+                                os.write(fd, command)
+                                print(
+                                    f'Sent {args.send!r} on the capture handle',
+                                    file=sys.stderr,
+                                )
+                            except (BlockingIOError, OSError) as error:
+                                if not args.reconnect:
+                                    raise
+                                print(
+                                    f'Command write failed: {error}',
+                                    file=sys.stderr,
+                                )
+                                break
+                            next_send = time.monotonic() + args.send_interval
                         timeout = 0.5
                         if deadline is not None:
                             timeout = min(timeout, max(0, deadline - time.monotonic()))

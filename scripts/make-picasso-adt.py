@@ -141,6 +141,8 @@ def main():
                         help='/chosen/memory-map RAMDisk placeholder; the loader fills in the real range for a scratch Data seed')
     parser.add_argument('--trust-cache', action='store_true', help='Zeroed TrustCache sidecar handoff placeholder')
     parser.add_argument('--gpu-addon', action='store_true', help='Zeroed GpuAddon sidecar handoff placeholder')
+    parser.add_argument('--random-seed', metavar='HEX',
+                        help='Exact 64-byte /chosen/random-seed value, for reproducible A/B trees')
     args = parser.parse_args()
     if (args.unique_chip_id is None) != (args.chip_id is None):
         parser.error('--unique-chip-id and --chip-id must be supplied together')
@@ -150,6 +152,15 @@ def main():
             not 0x10000000 <= args.owned_memory_size <= 0x200000000
             or args.owned_memory_size % 0x200000):
         parser.error('Owned memory must be 256 MiB to 8 GiB, aligned to 2 MiB')
+    if args.random_seed is None:
+        random_seed = os.urandom(64)
+    else:
+        try:
+            random_seed = bytes.fromhex(args.random_seed)
+        except ValueError:
+            parser.error('--random-seed must be hexadecimal')
+        if len(random_seed) != 64:
+            parser.error('--random-seed must encode exactly 64 bytes')
 
     try:
         cpu_regs = [int(value, 0) for value in args.cpu_regs.split(',')]
@@ -182,7 +193,7 @@ def main():
         ('#address-cells', struct.pack('<I', 2)),
         ('#size-cells', struct.pack('<I', 2)),
     ], [
-        node('chosen', [('random-seed', os.urandom(64)),
+        node('chosen', [('random-seed', random_seed),
                         # Without these XNU never publishes IOPlatformUUID and gethostuuid() blocks forever
                         # for callers (configd) that pass a zero timeout.
                         *([('unique-chip-id', struct.pack('<Q', args.unique_chip_id)), ('chip-id', struct.pack('<I', args.chip_id))]
