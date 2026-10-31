@@ -3624,3 +3624,26 @@ new file mode 100644
 + 	}
 + 	if (fdp->fd_rdir == olddp) {
 + 		old_rvp = olddp;
++diff --git a/patches/xnu/picasso-timebase-microtime.patch b/patches/xnu/picasso-timebase-microtime.patch
++new file mode 100644
++--- /dev/null
+++++ b/patches/xnu/picasso-timebase-microtime.patch
++@@ -0,0 +1,18 @@
+++--- a/osfmk/arm/rtclock.c
++++++ b/osfmk/arm/rtclock.c
+++@@ -468,7 +468,12 @@
+++ 	*secs = t64 = abstime / rtclock_sec_divisor;
+++ 	abstime -= (t64 * rtclock_sec_divisor);
+++-
++++
+++-	*microsecs = (uint32_t)(abstime / rtclock_usec_divisor);
++++	/* Native counters need not have an integral number of ticks per usec.
++++	 * At 19.2 MHz, dividing by floor(19.2) produces usecs above 999999 and
++++	 * makes the timestamp go backwards at each second boundary. Scale the
++++	 * subsecond remainder instead; it is below the u32 second divisor, so
++++	 * its u64 product with USEC_PER_SEC cannot overflow. */
++++	*microsecs = (clock_usec_t)((abstime * USEC_PER_SEC) / rtclock_sec_divisor);
+++ }
+++-
++++
+++ void

@@ -82,3 +82,30 @@ The next experiment should trace IOMobileFramebuffer selectors 4/5/72 and decide
 whether the missing frame is caused by an absent accelerators/front-board
 dependency or by a request-format mismatch. Adding a fake GPU success is not a
 valid next step.
+
+## Microtime repair
+
+The 19.2 MHz timebase exposed a second independent defect: XNU divided the
+subsecond remainder by the truncated integer divisor 19. This moved microtime
+backwards at each one-second boundary and produced negative APFS transaction
+durations.
+
+The follow-up image adds only `patches/xnu/picasso-timebase-microtime.patch`,
+which scales the remainder by `USEC_PER_SEC` and divides by the real second
+divisor. Timer INTID, watchdog deadlines, clock frequency and calendar
+adjustment are unchanged.
+
+| Item | SHA-256 |
+| --- | --- |
+| microtime boot image (`watchdog-microtime.img`) | `ff3144f6098bb05a5fdfb5c3f7f7a8da4ba11ecd6c16b8a23484cf8afcb16290` |
+| microtime payload | `3be26410fd3efcdb88c439770de93a7bf8547e612b70a3ea2c9a363ad8aefdf3` |
+| microtime kernel | `8ec6f3c6c84d3760163fda24eebc58eccf220291e07f12fb9232656772292e0a` |
+
+Kernel UUID: `47F3E939-9B1F-305F-8C08-B7F852C012AA`.
+
+The device again reaches launchd early boot, native IOWatchdog matching,
+backboardd display-client open, and SpringBoard. The capture no longer contains
+negative `tx took` values or `attrlistbulk_iterator` time underflow. The
+Framebuffer method trace is still not enabled, and no swap-validation or
+CPU-copy event has appeared; CPU-pixel presentation therefore remains
+unqualified on this combined image.
