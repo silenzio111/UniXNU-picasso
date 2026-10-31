@@ -41,6 +41,19 @@ panic: attempting to register a sysctl at previously registered slot : 189
 build and hardware boot; the current successful provider experiment used the
 prebuilt `m16p` kernel.
 
+The sysctl collision is not timing-dependent. A later sequence held the CDC
+control loop open, then sent `start-graphics`, `register-display` and
+`publish-display-start`; registration still succeeded and the same slot 189
+panic followed when `AppleFSCompressionTypeZlib` started. Deferring the command
+therefore does not avoid `postModLoad`.
+
+The source-built direct-initializer kernel currently stops before CDC
+enumeration. A byte-patched `m16p` kernel also stopped before CDC, so the
+prebuilt binary cannot be used to validate this fix without changing the
+prelink path. The remaining static work is to make the current source relink
+produce the same bootable local-kernel geometry as `m16p` before another device
+run.
+
 ## Reproduction baseline
 
 - Boot image: `out/picasso/boot/m16p-final-control-plane.img`
