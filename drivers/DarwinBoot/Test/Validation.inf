@@ -1,0 +1,26 @@
+## SPDX-License-Identifier: BSD-2-Clause-Patent
+[Defines]
+  INF_VERSION = 0x00010019
+  BASE_NAME = DarwinBootValidation
+  FILE_GUID = D30DA217-ED5B-49F9-8CEF-DA7EB04F9221
+  MODULE_TYPE = UEFI_DRIVER
+  VERSION_STRING = 0.1
+  ENTRY_POINT = ValidationEntry
+
+[Sources]
+  Validation.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  UniXNUPkg/UniXNUPkg.dec
+
+[LibraryClasses]
+  BaseMemoryLib
+  PrintLib
+  UefiBootServicesTableLib
+  UefiDriverEntryPoint
+  UefiLib
+
+[Protocols]
+  gUniXNULoaderProtocolGuid
+  gEfiLoadedImageProtocolGuid

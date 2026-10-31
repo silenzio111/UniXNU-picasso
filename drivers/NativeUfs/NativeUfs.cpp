@@ -32,6 +32,7 @@ extern const uint8_t verified_root_key[];
 #include <mach/mach_time.h>
 #include <pexpert/pexpert.h>
 #include <kern/debug.h>
+#include <machine/machine_routines.h>
 #include "GccUfs.h"
 #include "RootDiagnostics.h"
 #include "TransferPoll.h"
@@ -39,6 +40,14 @@ extern const uint8_t verified_root_key[];
 
 static UfsRootDiagnostics gRootDiagnostic;
 static bool gRootDiagnosticEnabled;
+// r51: allocation-free deferred-wait capture. Plain MRS+store only (no calls,
+// no IOLog): r50's IOLog/ml_get_interrupts_enabled() in this interrupt-disabled
+// context panicked in zalloc (photo: zalloc.c:6932 "Calling {k,z}alloc from
+// interrupt disabled context isn't allowed"). Values are printed later from the
+// timer sleep test, a context with proven-safe IOLog.
+uint64_t gPicassoDeferPreDaif = 0, gPicassoDeferPreVct = 0;
+uint64_t gPicassoDeferPostDaif = 0, gPicassoDeferPostVct = 0;
+unsigned gPicassoDeferPostOk = 0;
 static void rootDiagnosticFailure (const char *reason);
 
 extern "C" {
@@ -1684,6 +1693,78 @@ extern "C" int native_ufs_block_authenticates (IOService *provider, const char *
   return block->authenticatesVolume (uuid, digest) ? 1 : 0;
 }
 
+// Resolve one BSD media back to its exact NativeUfs window. The caller gets
+// the window's owner-signed manifest digest when the UUID matches.
+static int nativeUfsVerifiedVolumeQuery (dev_t device, const char *expectedUuid,
+                                         uint8_t digest[48])
+{
+  if (device == NODEV) {
+    return 0;
+  }
+  if (digest) {
+    bzero (digest, 48);
+  }
+
+  OSDictionary *matching = IOService::serviceMatching ("IOMedia");
+  OSDictionary *properties = OSDictionary::withCapacity (2);
+  OSNumber *majorValue = OSNumber::withNumber (major (static_cast<uint32_t> (device)), 32);
+  OSNumber *minorValue = OSNumber::withNumber (minor (static_cast<uint32_t> (device)), 32);
+  if (!matching || !properties || !majorValue || !minorValue) {
+    OSSafeReleaseNULL (minorValue);
+    OSSafeReleaseNULL (majorValue);
+    OSSafeReleaseNULL (properties);
+    OSSafeReleaseNULL (matching);
+    return 0;
+  }
+  bool ready = properties->setObject (kIOBSDMajorKey, majorValue) &&
+               properties->setObject (kIOBSDMinorKey, minorValue) &&
+               matching->setObject ("IOPropertyMatch", properties);
+  OSSafeReleaseNULL (minorValue);
+  OSSafeReleaseNULL (majorValue);
+  OSSafeReleaseNULL (properties);
+  OSIterator *iterator = ready ? IOService::getMatchingServices (matching) : nullptr;
+  OSSafeReleaseNULL (matching);
+  if (!iterator) {
+    return 0;
+  }
+
+  bool authenticated = false;
+  unsigned matches = 0;
+  while (OSObject *object = iterator->getNextObject ()) {
+    IOService *media = OSDynamicCast (IOService, object);
+    if (!media) {
+      continue;
+    }
+    if (++matches != 1) {
+      authenticated = false;
+      break;
+    }
+    OSString *uuid = OSDynamicCast (OSString, media->getProperty ("UUID"));
+    if (!uuid || uuid->getLength () != 36 ||
+        (expectedUuid && strcmp (expectedUuid, uuid->getCStringNoCopy ()))) {
+      continue;
+    }
+    for (IOService *provider = media; provider; provider = provider->getProvider ()) {
+      NativeUfsBlock *block = OSDynamicCast (NativeUfsBlock, provider);
+      if (block) {
+        authenticated = block->authenticatesVolume (uuid->getCStringNoCopy (), digest);
+        break;
+      }
+    }
+  }
+  iterator->release ();
+  return authenticated && matches == 1;
+}
+
+extern "C" int native_verified_block_manifest_sha384 (dev_t device, const char *uuid,
+                                                       uint8_t digest[48])
+{
+  if (!uuid || strlen (uuid) != 36) {
+    return 0;
+  }
+  return nativeUfsVerifiedVolumeQuery (device, uuid, digest);
+}
+
 // Resolve the dev_t XNU mounted as its root back through the IORegistry to
 // the NativeUfs window that owns it. The UUID check binds that media to the
 // owner-signed manifest; the provider walk prevents an unrelated IOMedia from
@@ -1777,6 +1858,76 @@ extern "C" int native_verified_block_root_authorized (dev_t device)
            static_cast<unsigned> (device), uuidText, providerClass, depth);
   }
   return result;
+}
+
+extern "C" int native_verified_block_volume_device (const char *uuid, dev_t *device,
+                                                     char *path, size_t size)
+{
+  if (!uuid || strlen (uuid) != 36 || !device || !path || size < 6) {
+    return 0;
+  }
+  *device = NODEV;
+  path[0] = 0;
+
+  OSDictionary *matching = IOService::serviceMatching ("IOMedia");
+  OSDictionary *properties = OSDictionary::withCapacity (1);
+  OSString *wanted = OSString::withCString (uuid);
+  if (!matching || !properties || !wanted) {
+    OSSafeReleaseNULL (wanted);
+    OSSafeReleaseNULL (properties);
+    OSSafeReleaseNULL (matching);
+    return 0;
+  }
+  bool ready = properties->setObject ("UUID", wanted) &&
+               matching->setObject ("IOPropertyMatch", properties);
+  OSSafeReleaseNULL (wanted);
+  OSSafeReleaseNULL (properties);
+  OSIterator *iterator = ready ? IOService::getMatchingServices (matching) : nullptr;
+  OSSafeReleaseNULL (matching);
+  if (!iterator) {
+    return 0;
+  }
+
+  bool authorized = false;
+  unsigned matches = 0;
+  dev_t candidate = NODEV;
+  char candidatePath[64] = {};
+  while (OSObject *object = iterator->getNextObject ()) {
+    IOService *media = OSDynamicCast (IOService, object);
+    if (!media) {
+      continue;
+    }
+    if (++matches != 1) {
+      authorized = false;
+      break;
+    }
+    OSString *identity = OSDynamicCast (OSString, media->getProperty ("UUID"));
+    OSString *name = OSDynamicCast (OSString, media->getProperty (kIOBSDNameKey));
+    OSNumber *majorValue = OSDynamicCast (OSNumber, media->getProperty (kIOBSDMajorKey));
+    OSNumber *minorValue = OSDynamicCast (OSNumber, media->getProperty (kIOBSDMinorKey));
+    if (!identity || strcmp (identity->getCStringNoCopy (), uuid) || !name || !majorValue ||
+        !minorValue || !name->getLength () || name->getLength () >= sizeof (candidatePath) - 6 ||
+        name->getLength () >= size - 6 || majorValue->unsigned64BitValue () > 255 ||
+        minorValue->unsigned64BitValue () > 0xffffff) {
+      continue;
+    }
+    candidate = static_cast<dev_t> (
+      makedev (majorValue->unsigned32BitValue (), minorValue->unsigned32BitValue ()));
+    if (!native_verified_block_root_authorized (candidate)) {
+      continue;
+    }
+    snprintf (candidatePath, sizeof (candidatePath), "/dev/%s", name->getCStringNoCopy ());
+    authorized = true;
+  }
+  iterator->release ();
+  if (!authorized || matches != 1) {
+    return 0;
+  }
+  *device = candidate;
+  strlcpy (path, candidatePath, size);
+  IOLog ("NATIVE_OWNER_VOLUME uuid=%s device=%x path=%s result=1\n",
+         uuid, static_cast<unsigned> (candidate), path);
+  return 1;
 }
 #endif
 
@@ -2082,7 +2233,13 @@ static void mediaReportThread (void *, wait_result_t)
   if (matching) {
     matching->release ();
   }
-  panic ("%s", gMediaReport);
+  unsigned reportPanic = 0;
+  PE_parse_boot_argn ("native-ufs-media-report-panic", &reportPanic,
+                      sizeof (reportPanic));
+  if (reportPanic) {
+    panic ("%s", gMediaReport);
+  }
+  IOLog ("%s", gMediaReport);
 }
 
 void NativeUfs::deferredRootStart (void *, wait_result_t)
@@ -2092,11 +2249,26 @@ void NativeUfs::deferredRootStart (void *, wait_result_t)
   PE_parse_boot_argn ("native-ufs-delay-yield", &delayYield, sizeof (delayYield));
   IOLog ("NATIVE_UFS_DEFER waiting=%us mode=%s\n",
          delay, delayYield ? "timebase-yield" : "blocking");
+  {
+    uint64_t daif = 0, vct = 0;
+    __asm__ volatile ("mrs %0, daif" : "=r" (daif) :: "memory");
+    __asm__ volatile ("mrs %0, cntvct_el0" : "=r" (vct) :: "memory");
+    gPicassoDeferPreDaif = daif;
+    gPicassoDeferPreVct = vct;
+  }
   bool waitSucceeded = true;
   if (delayYield) {
     waitSucceeded = waitTimebaseSecondsWithYield (delay);
   } else {
     IOSleep (delay * 1000);
+  }
+  {
+    uint64_t daif = 0, vct = 0;
+    __asm__ volatile ("mrs %0, daif" : "=r" (daif) :: "memory");
+    __asm__ volatile ("mrs %0, cntvct_el0" : "=r" (vct) :: "memory");
+    gPicassoDeferPostDaif = daif;
+    gPicassoDeferPostVct = vct;
+    gPicassoDeferPostOk = waitSucceeded ? 1U : 0U;
   }
   if (!waitSucceeded) {
     IOLog ("NATIVE_UFS_DEFER timebase unavailable; root start skipped\n");

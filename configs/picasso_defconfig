@@ -6,6 +6,7 @@
 
 CONFIG_XNU_BUILD_ARCHIVES=y
 CONFIG_XNU_SOURCE_CORECRYPTO14=y
+CONFIG_XNU_NATIVE_AES=y
 CONFIG_XNU_ARM_DT_PLATFORM=y
 CONFIG_XNU_ARMCPU=y
 CONFIG_XNU_NATIVE_ARCH_TIMER=y
@@ -20,23 +21,34 @@ CONFIG_XNU_EXTRA_LD_ARCHIVES=""
 # CONFIG_XNU_SOURCE_PTHREAD is not set
 # CONFIG_XNU_SOURCE_MOCKFS is not set
 CONFIG_XNU_NATIVE_UFS=y
-# CONFIG_XNU_NATIVE_AES is not set
+# r84: force-load the audited original ApplePMGRNub publication shim.
+CONFIG_XNU_SHENG_PMGR=y
+# r63: typed backend for the scratch Data seed (DATA_MOUNT's gpu-addon/data
+# prepare references native_ram_block_*; sheng pairs both flags).
+CONFIG_XNU_NATIVE_RAM_BLOCK=y
 # CONFIG_XNU_NATIVE_VIRTIO_BLOCK is not set
 # CONFIG_XNU_NATIVE_VIRTIO_CONSOLE is not set
-# CONFIG_XNU_NATIVE_RAM_BLOCK is not set
 # CONFIG_XNU_NATIVE_MOBILE_DISPLAY is not set
-# CONFIG_XNU_NATIVE_LEGACY_DISPLAY is not set
+CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
 # CONFIG_XNU_NATIVE_ADRENO is not set
 # CONFIG_XNU_ARMVIRT_PLATFORM is not set
 # CONFIG_XNU_ZONE_PGZ_ALIGNMENT_PROBE is not set
 # CONFIG_XNU_VERIFIED_ROOT_PROBE is not set
 CONFIG_XNU_OWNER_ROOT_AUDIT=y
 CONFIG_XNU_OWNER_ROOT_TRUST=y
-# CONFIG_XNU_OWNER_CACHE_MOUNT is not set
-# CONFIG_XNU_OWNER_CACHE_STARTUP is not set
-# CONFIG_XNU_OWNER_BOOT_MANIFEST is not set
-# CONFIG_XNU_OWNER_DATA_MOUNT is not set
-# CONFIG_XNU_OWNER_UNION_SYSTEMOS is not set
+CONFIG_XNU_OWNER_CACHE_MOUNT=y
+CONFIG_XNU_OWNER_CACHE_STARTUP=y
+# The union composition exposes the SystemOS cache at its original paths.
+# Keep the old carrier selector off so shared-cache lookup follows the native
+# union layout instead of the /private/preboot compatibility path.
+# CONFIG_XNU_OWNER_CACHE_CARRIER is not set
+CONFIG_XNU_OWNER_BOOT_MANIFEST=y
+CONFIG_XNU_OWNER_DATA_MOUNT=y
+# Compose SystemOS over the OS root so userland can resolve files such as
+# /usr/lib/libobjc-trampolines.dylib and the dyld shared cache at their
+# original paths. The mount remains read-only and owner-verified.
+CONFIG_XNU_OWNER_UNION_SYSTEMOS=y
 # CONFIG_XNU_BOOT_PROGRESS is not set
 
-CONFIG_XNU_OWNER_DATA_VOLUME_UUID="00000000-0000-0000-0000-000000000000"
+CONFIG_XNU_OWNER_DATA_VOLUME_UUID="8073AA21-2ACD-47C4-9B24-D28C484E4439"
+CONFIG_XNU_OWNER_CACHE_VOLUME_UUID="8846FE78-2910-4297-AF97-D59BB6F8FC16"

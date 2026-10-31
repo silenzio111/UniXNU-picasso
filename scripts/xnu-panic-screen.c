@@ -47,6 +47,19 @@ struct ctx {
 #ifndef GPRAM
 #define GPRAM 0UL
 #endif
+/* CDC mirror: both panic entries branch here directly, bypassing the C panic
+ * hooks, so the renderer hands its text to the USB console itself before it
+ * parks. Addresses resolved from the kernel symbol table by the patcher;
+ * 0 disables the part. */
+#ifndef USB_PANIC_BEGIN
+#define USB_PANIC_BEGIN 0UL
+#endif
+#ifndef USB_PANIC_WRITE
+#define USB_PANIC_WRITE 0UL
+#endif
+#ifndef USB_PANIC_RESET
+#define USB_PANIC_RESET 0UL
+#endif
 
 __attribute__((noreturn)) static void park (void)
 {
@@ -248,6 +261,11 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   if (mark[0] == 0xC0FFEE11u && mark[1] == 0x5CEEDA7Au) {
     park ();
   }
+  /* Arm the CDC panic path first: the C hooks never run (both panic entries
+   * branch here directly), so the renderer owns the USB handoff. */
+  if (USB_PANIC_BEGIN) {
+    ((void (*)(void))USB_PANIC_BEGIN)();
+  }
   g.x = 0;
   g.y = g.h / 8;
   g.log = 0;
@@ -303,6 +321,18 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
       }
       *(volatile u8 *)(pb + 0x100 + g.logn) = 0;
     }
+  }
+  /* Mirror the captured text to CDC, drain it, then take the configured reset
+   * path so the board returns to Fastboot on its own instead of waiting for a
+   * watchdog bite. Each part compiles out when its symbol is missing. */
+  /* Zero-length writes no-op inside picasso_usb_panic_write, so no logn test. */
+  if (USB_PANIC_WRITE) {
+    ((void (*)(const char *, int))USB_PANIC_WRITE)((const char *)g.log, (int)g.logn);
+  }
+  /* No standalone flush: picasso_usb_panic_reset() drains the ring itself
+   * before it arms the Fastboot reason and PSHOLD-resets. */
+  if (USB_PANIC_RESET) {
+    ((void (*)(void))USB_PANIC_RESET)();
   }
   mark[0] = 0xC0FFEE11u;
   mark[1] = 0x5CEEDA7Au;

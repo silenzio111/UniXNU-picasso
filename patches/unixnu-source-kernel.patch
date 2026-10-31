@@ -41,41 +41,50 @@ index 0000000..7d87b2d
 +runtime. UFS / VirtIO / display / Adreno archives join the [kernel] archives
 +list of board.toml in later stages.
 diff --git a/patches/xnu/offline-component-load-probes.patch b/patches/xnu/offline-component-load-probes.patch
-index 94bf523..69d5e48 100644
+index 94bf523..7336402 100644
 --- a/patches/xnu/offline-component-load-probes.patch
 +++ b/patches/xnu/offline-component-load-probes.patch
-@@ -1,6 +1,6 @@
+@@ -1,6 +1,8 @@
++diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
++index bb558eebd..c1dd9cc5e 100644
  --- a/bsd/kern/bsd_init.c
  +++ b/bsd/kern/bsd_init.c
 -@@ -478,5 +478,88 @@
-+@@ -478,5 +478,90 @@
++@@ -478,6 +478,90 @@ bsd_rooted_ramdisk(void)
    * of the tro_ucred field so that the uthread structure can be
    * used like any other.
    */
-@@ -72,12 +72,14 @@
+@@ -71,6 +73,7 @@
+ +		return;
  +	}
  +	native_mobile_graphics_load_status = OSKextLoadKextWithIdentifier("com.apple.iokit.IOMobileGraphicsFamily");
+++	printf("PICASSO MOBILE: load status=%d\n", native_mobile_graphics_load_status);
  +	native_mobile_graphics_probe_checkpoint();
-++#if defined(XNU_NATIVE_LEGACY_DISPLAY) && XNU_NATIVE_LEGACY_DISPLAY
  +	int legacy_register = 0;
  +	if (native_mobile_graphics_load_status == 0 &&
- +	    PE_parse_boot_argn("offline-legacy-register", &legacy_register, sizeof(legacy_register)) && legacy_register) {
- +		extern void native_legacy_display_probe(void);
- +		native_legacy_display_probe();
- +	}
-++#endif
- +	int client_probe = 0;
- +	if (native_mobile_graphics_load_status == 0 &&
- +	    PE_parse_boot_argn("offline-mobile-graphics-client", &client_probe, sizeof(client_probe)) && client_probe) {
-@@ -89,7 +91,7 @@
+@@ -89,7 +92,8 @@
  +
   void
   bsd_init(void)
 -@@ -698,6 +774,27 @@
-+@@ -698,6 +776,27 @@
++ {
++@@ -697,6 +781,27 @@ bsd_init(void)
   	/* Initialize the file systems. */
   	bsd_init_kprintf("calling vfsinit\n");
   	vfsinit();
+@@ -117,9 +121,11 @@
+  
+  #if CONFIG_PROC_UUID_POLICY
+  	/* Initial proc_uuid_policy subsystem */
++diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
++index ad633d5cb..e7d65922b 100644
+ --- a/iokit/Kernel/IOUserClient.cpp
+ +++ b/iokit/Kernel/IOUserClient.cpp
+-@@ -6693,3 +6693,66 @@
++@@ -6693,3 +6693,66 @@ OSMetaClassDefineReservedUnused(IOUserClient2022, 0);
+  OSMetaClassDefineReservedUnused(IOUserClient2022, 1);
+  OSMetaClassDefineReservedUnused(IOUserClient2022, 2);
+  OSMetaClassDefineReservedUnused(IOUserClient2022, 3);
 diff --git a/patches/xnu/zzz-picasso-usb-console.patch b/patches/xnu/zzz-picasso-usb-console.patch
 new file mode 100644
 index 0000000..8449d72
@@ -1593,13 +1602,14 @@ index 65e52bc..0f900d5 100644
 diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
 --- a/scripts/build-xnu-4k-baseline.sh
 +++ b/scripts/build-xnu-4k-baseline.sh
-@@ -35,7 +35,9 @@ fi
+@@ -35,7 +35,10 @@ fi
  # Remove them first so earlier independent patches retain their idempotent checks.
  # The same holds for the boot-time GPU addon mount and the staged system apps copy (zzy), which edit the owner Data mount function
  # inside the systemos patch. Reverse newest first; the loop below re-applies them in name order.
 -for LATE_PATCH in "$ROOT/patches/xnu/zzz-boot-progress.patch" "$ROOT/patches/xnu/zzy-staged-system-apps.patch" \
 +for LATE_PATCH in "$ROOT/patches/xnu/zzz-picasso-usb-console.patch" \
 +    "$ROOT/patches/xnu/zzz-picasso-console-ring.patch" \
++    "$ROOT/patches/xnu/zzz-picasso-legacy-weak.patch" \
 +    "$ROOT/patches/xnu/zzz-boot-progress.patch" "$ROOT/patches/xnu/zzy-staged-system-apps.patch" \
      "$ROOT/patches/xnu/zzy-native-gpu-addon-mount.patch"; do
    if git -C .cache/xnu-work apply --reverse --check "$LATE_PATCH" >/dev/null 2>&1; then
@@ -1625,3 +1635,22 @@ diff --git a/scripts/build-xnu-4k-baseline.sh b/scripts/build-xnu-4k-baseline.sh
    exit 1
  fi
  ADRENO_FIRMWARE_PROBE=${XNU_ADRENO_FIRMWARE_PROBE:-0}
+diff --git a/patches/xnu/zzz-picasso-legacy-weak.patch b/patches/xnu/zzz-picasso-legacy-weak.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/xnu/zzz-picasso-legacy-weak.patch
+@@ -0,0 +1,14 @@
++diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
++--- a/bsd/kern/bsd_init.c
+++++ b/bsd/kern/bsd_init.c
++@@ -551,6 +551,6 @@ native_mobile_graphics_load_probe(void)
++ 	int legacy_register = 0;
++ 	if (native_mobile_graphics_load_status == 0 &&
++ 	    PE_parse_boot_argn("offline-legacy-register", &legacy_register, sizeof(legacy_register)) && legacy_register) {
++-		extern void native_legacy_display_probe(void);
++-		native_legacy_display_probe();
+++		extern void native_legacy_display_probe(void) __attribute__((weak));
+++		if (native_legacy_display_probe) native_legacy_display_probe();
++ 	}
++ 	int client_probe = 0;
++ 	if (native_mobile_graphics_load_status == 0 &&

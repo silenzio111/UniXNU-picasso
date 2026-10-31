@@ -12,10 +12,9 @@ index 19b4065..b22147f 100644
  
 diff --git a/bsd/dev/picasso_usb.c b/bsd/dev/picasso_usb.c
 new file mode 100644
-index 0000000..4cddf14
 --- /dev/null
 +++ b/bsd/dev/picasso_usb.c
-@@ -0,0 +1,2776 @@
+@@ -0,0 +1,3136 @@
 +/* Picasso USB debug console: CDC-ACM log streaming over DWC3.
 + *
 + * Port of the vermeer (ios-vermeer-lab) USB bring-up to the UniXNU Darwin 23
@@ -69,8 +68,14 @@ index 0000000..4cddf14
 +#define APSS_WDT_BITE       0x14u
 +#define APSS_WDT_RATE_HZ    32768u
 +#define APSS_WDT_TIMEOUT_MS 15000u
++/* Picasso readback truncates at 20 bits, matching vendor WDOG_BITE_TIME. */
++#define APSS_WDT_COUNTER_MAX 0xfffffu
++#define APSS_WDT_MAX_TIMEOUT_MS 32000u
 +#define APSS_WDT_FORCED_BITE 4u
 +#define PICASSO_USB_CONTROL_DEFAULT_MS 60000u
++#define PICASSO_USB_CONTROL_RESET_DEFAULT_MS 15000u
++#define PICASSO_USB_HOST_TIMEOUT_MS 60000u
++#define PICASSO_USB_HOST_BOOT_GRACE_MS 120000u
 +#define PICASSO_USB_FLUSH_POLLS 64u
 +#define PICASSO_USB_FINAL_FLUSH_POLLS 8u
 +#define PICASSO_USB_FLUSH_GAP_US 100u
@@ -113,6 +118,8 @@ index 0000000..4cddf14
 +static void ud_process_command(void);
 +static void ud_finish_reboot(void);
 +static void picasso_usb_watchdog_disable(void);
++static bool picasso_usb_arm_fastboot_reason(void);
++static void picasso_usb_watchdog_reset(void);
 +static void ud_configure(void);
 +
 +void
@@ -383,10 +390,20 @@ index 0000000..4cddf14
 +	bool        live;
 +	bool        hold;
 +	unsigned    control_ms;
++	bool        control_reset;
++	unsigned    control_reset_ms;
++	uint64_t    control_deadline;
 +	bool        host_open;
++	bool        host_seen;
++	uint64_t    host_deadline;
++	unsigned    host_timeout_ms;
++	unsigned    host_boot_grace_ms;
 +	bool        panic_test;
 +	bool        panic_mode;
 +	bool        panic_pending;
++	bool        start_kext_pending;
++	int         publish_pending;
++	bool        register_pending;
 +	bool        panic_reset;
 +	bool        cmd_pending;
 +	bool        reboot_pending;
@@ -394,6 +411,7 @@ index 0000000..4cddf14
 +	bool        hang_pending;
 +	bool        watchdog;
 +	bool        watchdog_armed;
++	unsigned    watchdog_ms;
 +	unsigned    reset_mode;
 +	vm_offset_t pshold;
 +	vm_offset_t wdt;
@@ -402,6 +420,7 @@ index 0000000..4cddf14
 +	uint64_t    tx_pos;                  /* ring reader position */
 +	uint64_t    events, chars, rx_bytes;
 +	uint64_t    commands;
++	uint64_t    timer_ticks;
 +	uint32_t    mps;
 +	uint32_t    setups;
 +	uint32_t    ep0_active_ep;
@@ -555,9 +574,31 @@ index 0000000..4cddf14
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +}
 +
++static inline uint64_t
++picasso_usb_counter(void)
++{
++	uint64_t value;
++	__asm__ volatile ("isb" ::: "memory");
++	__asm__ volatile ("mrs %0, cntvct_el0" : "=r" (value) :: "memory");
++	return value;
++}
++
++static inline uint64_t
++picasso_usb_counter_frequency(void)
++{
++	uint64_t value;
++	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (value));
++	return value;
++}
++
++static void picasso_usb_emergency_fastboot(const char *reason);
++
 +/*
 + * delay() can block on this early boot path before the scheduler is usable.
-+ * Use a bounded ARM yield loop for register settling and polling gaps.
++ * r21 kernel bisection vs v5: restore the v5 bounded ARM yield loop.
++ * The cntvct-based rewrite is the prime suspect for the 38-40 s death
++ * (every DWC3/handoff/control delay changed timing). Counter helpers stay
++ * for the control-loop deadline reads; the wait itself does no counter I/O.
 + */
 +static void
 +picasso_usb_busy_wait(unsigned usec)
@@ -1894,6 +1935,36 @@ index 0000000..4cddf14
 +	return *command == '\0' && *expected == '\0';
 +}
 +
++static uint64_t
++picasso_usb_deadline(unsigned milliseconds)
++{
++	uint64_t frequency = picasso_usb_counter_frequency();
++	if (frequency == 0 || milliseconds == 0) {
++		return 0;
++	}
++	return picasso_usb_counter() + frequency * milliseconds / 1000u;
++}
++
++static void
++picasso_usb_host_kick(void)
++{
++	if (ud.host_seen) {
++		ud.host_deadline = picasso_usb_deadline(ud.host_timeout_ms);
++	}
++}
++
++static void
++picasso_usb_host_ready(void)
++{
++	if (!ud.configured || !ud.host_open) {
++		return;
++	}
++	ud.host_seen = true;
++	ud.host_deadline = picasso_usb_deadline(ud.host_timeout_ms);
++	printf("PICASSO USB: host supervision armed timeout=%u ms\n",
++	    ud.host_timeout_ms);
++}
++
 +static void
 +picasso_usb_watchdog_pet(void)
 +{
@@ -1902,24 +1973,37 @@ index 0000000..4cddf14
 +	}
 +}
 +
++static uint32_t
++picasso_usb_watchdog_ticks(unsigned milliseconds)
++{
++	uint64_t ticks = (uint64_t)milliseconds * APSS_WDT_RATE_HZ / 1000u;
++	if (ticks == 0) {
++		return 0;
++	}
++	/* Saturate before narrowing; overflow must never shorten the timeout. */
++	return ticks - 1u > APSS_WDT_COUNTER_MAX ?
++	       APSS_WDT_COUNTER_MAX : (uint32_t)(ticks - 1u);
++}
++
 +static void
 +picasso_usb_watchdog_arm(void)
 +{
 +	if (!ud.watchdog || ud.wdt == 0) {
 +		return;
 +	}
-+	uint32_t ticks =
-+	    (APSS_WDT_TIMEOUT_MS * APSS_WDT_RATE_HZ / 1000u) - 1u;
++	uint32_t ticks = picasso_usb_watchdog_ticks(ud.watchdog_ms);
 +	usb_wr(ud.wdt, APSS_WDT_EN, 0);
 +	usb_wr(ud.wdt, APSS_WDT_RST, 1);
 +	usb_wr(ud.wdt, APSS_WDT_BARK, ticks);
 +	usb_wr(ud.wdt, APSS_WDT_BITE, ticks);
 +	usb_wr(ud.wdt, APSS_WDT_EN, 1);
-+	ud.watchdog_armed = true;
-+	printf("PICASSO USB: APSS watchdog armed ticks=%u bark=%u bite=%u ctl=%u\n",
-+	    ticks, usb_rd(ud.wdt, APSS_WDT_BARK),
-+	    usb_rd(ud.wdt, APSS_WDT_BITE),
-+	    usb_rd(ud.wdt, APSS_WDT_EN));
++	uint32_t bark = usb_rd(ud.wdt, APSS_WDT_BARK);
++	uint32_t bite = usb_rd(ud.wdt, APSS_WDT_BITE);
++	uint32_t ctl = usb_rd(ud.wdt, APSS_WDT_EN);
++	ud.watchdog_armed = bark == ticks && bite == ticks && (ctl & 1u);
++	printf("PICASSO USB: APSS watchdog %s ticks=%u bark=%u bite=%u ctl=%u effective_ms=%u\n",
++	    ud.watchdog_armed ? "armed" : "REJECTED", ticks, bark, bite, ctl,
++	    ud.watchdog_ms);
 +}
 +
 +static void
@@ -2016,8 +2100,7 @@ index 0000000..4cddf14
 +		 * controller reload a long count when BITE is rewritten.
 +		 */
 +		if (!(usb_rd(ud.wdt, APSS_WDT_EN) & 1u)) {
-+			uint32_t ticks =
-+			    (APSS_WDT_TIMEOUT_MS * APSS_WDT_RATE_HZ / 1000u) - 1u;
++			uint32_t ticks = picasso_usb_watchdog_ticks(ud.watchdog_ms);
 +			usb_wr(ud.wdt, APSS_WDT_BARK, ticks);
 +			usb_wr(ud.wdt, APSS_WDT_BITE, ticks);
 +			usb_wr(ud.wdt, APSS_WDT_EN, 1);
@@ -2030,6 +2113,46 @@ index 0000000..4cddf14
 +		for (;;) {
 +			__asm__ volatile ("wfe" ::: "memory");
 +		}
++	}
++}
++
++static void
++picasso_usb_host_fail_fastboot(void)
++{
++	if (ud.imem != 0) {
++		usb_wr(ud.imem, IMEM_RESTART_REASON, IMEM_FASTBOOT_MODE);
++	}
++	if (ud.wdt != 0) {
++		usb_wr(ud.wdt, APSS_WDT_RST, 1);
++		usb_wr(ud.wdt, APSS_WDT_BITE, APSS_WDT_FORCED_BITE);
++	} else if (ud.pshold != 0) {
++		*(volatile uint32_t *)ud.pshold = 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	__asm__ volatile ("msr daifset, #0xf" ::: "memory");
++	for (;;) {
++		__asm__ volatile ("wfe" ::: "memory");
++	}
++}
++
++static void
++picasso_usb_watchdog_service(void)
++{
++	if (!ud.watchdog_armed || ud.host_deadline == 0) {
++		return;
++	}
++	if ((int64_t)(picasso_usb_counter() - ud.host_deadline) >= 0) {
++		picasso_usb_host_fail_fastboot();
++	}
++	picasso_usb_watchdog_pet();
++}
++
++void
++picasso_usb_timer_tick(void)
++{
++	ud.timer_ticks++;
++	if (ud.watchdog_armed) {
++		picasso_usb_watchdog_service();
 +	}
 +}
 +
@@ -2048,6 +2171,35 @@ index 0000000..4cddf14
 +	if (!picasso_usb_pshold_reset()) {
 +		printf("PICASSO CDC: reset failed; console remains alive\n");
 +	}
++}
++
++static void
++picasso_usb_emergency_fastboot(const char *reason)
++{
++	/*
++	 * This path must not call back into the USB poll path: it is invoked
++	 * from inside a bounded register/USB wait. Arm the firmware reason
++	 * first, then drive PSHOLD directly. The mapped registers were set up
++	 * before any DWC3 access, so this remains available during enumeration.
++	 */
++	if (ud.imem != 0) {
++		usb_wr(ud.imem, IMEM_RESTART_REASON, IMEM_FASTBOOT_MODE);
++	}
++	if (ud.pshold != 0) {
++		/*
++		 * Do not print before resetting. Console output can itself block
++		 * on this broken-early-boot path; reset availability is the only
++		 * guarantee this emergency path must preserve.
++		 */
++		*(volatile uint32_t *)ud.pshold = 0;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		__asm__ volatile ("msr daifset, #0xf" ::: "memory");
++		for (;;) {
++			__asm__ volatile ("wfe" ::: "memory");
++		}
++	}
++	printf("PICASSO USB: EMERGENCY reset unavailable (%s); PSHOLD not mapped\n",
++	    reason);
 +}
 +
 +static bool
@@ -2111,18 +2263,25 @@ index 0000000..4cddf14
 +{
 +	ud.cmd_pending = false;
 +	ud.commands++;
++	picasso_usb_host_kick();
 +	printf("PICASSO CDC: command '%s'\n", ud.cmd);
 +	if (ud_command_is(ud.cmd, "help")) {
-+		printf("PICASSO CDC: commands: help | status | panic-test | reset-test | hang-test | reboot-fastboot\n");
++		printf("PICASSO CDC: commands: help | ping | status | panic-test | reset-test | start-graphics | register-display | publish-display | publish-display-start | hang-test | reboot-fastboot\n");
++	} else if (ud_command_is(ud.cmd, "ping")) {
++		printf("PICASSO CDC: pong\n");
 +	} else if (ud_command_is(ud.cmd, "status")) {
-+		printf("PICASSO CDC: configured=%u host_open=%u live=%u panic=%u "
++		uint64_t now = picasso_usb_counter();
++		printf("PICASSO CDC: configured=%u host_open=%u host_seen=%u "
++		    "host_ms=%u live=%u panic=%u "
 +		    "watchdog=%u armed=%u reset=%u events=%llu tx=%llu "
-+		    "rx=%llu dropped=%llu\n",
++		    "rx=%llu dropped=%llu timer=%llu now=%llu deadline=%llu\n",
 +		    ud.configured ? 1u : 0u, ud.host_open ? 1u : 0u,
++		    ud.host_seen ? 1u : 0u, ud.host_timeout_ms,
 +		    ud.live ? 1u : 0u, ud.panic_mode ? 1u : 0u,
 +		    ud.watchdog ? 1u : 0u, ud.watchdog_armed ? 1u : 0u,
 +		    ud.reset_mode, ud.events, ud.chars, ud.rx_bytes,
-+		    os_atomic_load(&pur_dropped, relaxed));
++		    os_atomic_load(&pur_dropped, relaxed), ud.timer_ticks,
++		    now, ud.host_deadline);
 +	} else if (ud_command_is(ud.cmd, "panic-test")) {
 +		printf("PICASSO CDC: panic-test requested; emitting marker now\n");
 +		/*
@@ -2131,6 +2290,18 @@ index 0000000..4cddf14
 +		 * panic flush path would recursively drive the same DWC3 event ring.
 +		 */
 +		ud.panic_pending = true;
++	} else if (ud_command_is(ud.cmd, "start-graphics")) {
++		printf("PICASSO CDC: start-graphics requested; starting IOMobileGraphicsFamily\n");
++		ud.start_kext_pending = true;
++	} else if (ud_command_is(ud.cmd, "register-display")) {
++		printf("PICASSO CDC: register-display requested; running static init\n");
++		ud.register_pending = true;
++	} else if (ud_command_is(ud.cmd, "publish-display")) {
++		printf("PICASSO CDC: publish-display requested; allocate+init only\n");
++		ud.publish_pending = 1;
++	} else if (ud_command_is(ud.cmd, "publish-display-start")) {
++		printf("PICASSO CDC: publish-display-start requested; attach+start+register\n");
++		ud.publish_pending = 2;
 +	} else if (ud_command_is(ud.cmd, "reset-test")) {
 +		printf("PICASSO CDC: reset-test requested; draining then reset mode %u\n",
 +		    ud.reset_mode);
@@ -2266,6 +2437,43 @@ index 0000000..4cddf14
 +	}
 +	ud_poll();
 +	os_atomic_store(&ud.poll_lock, 0, release);
++	if (ud.start_kext_pending && !ud.panic_mode) {
++		ud.start_kext_pending = false;
++		extern kern_return_t native_start_kext_and_report(const char *,
++		    const char *) __attribute__((weak));
++		if (native_start_kext_and_report != 0) {
++			kern_return_t result = native_start_kext_and_report(
++			    "com.apple.iokit.IOMobileGraphicsFamily",
++			    "IOMobileFramebufferLegacy");
++			printf("PICASSO CDC: start-graphics result=%d\n", result);
++		} else {
++			printf("PICASSO CDC: start-graphics helper unavailable\n");
++		}
++	}
++	if (ud.register_pending && !ud.panic_mode) {
++		ud.register_pending = false;
++		extern kern_return_t native_register_display_and_report(void)
++		    __attribute__((weak));
++		if (native_register_display_and_report != 0) {
++			kern_return_t result = native_register_display_and_report();
++			printf("PICASSO CDC: register-display result=%d\n", result);
++		} else {
++			printf("PICASSO CDC: register-display helper unavailable\n");
++		}
++	}
++	if (ud.publish_pending && !ud.panic_mode) {
++		int level = ud.publish_pending - 1;
++		ud.publish_pending = 0;
++		extern kern_return_t native_publish_display_and_report(int)
++		    __attribute__((weak));
++		if (native_publish_display_and_report != 0) {
++			kern_return_t result =
++			    native_publish_display_and_report(level);
++			printf("PICASSO CDC: publish-display result=%d\n", result);
++		} else {
++			printf("PICASSO CDC: publish-display helper unavailable\n");
++		}
++	}
 +	if (ud.reboot_pending && !ud.panic_mode) {
 +		ud.reboot_pending = false;
 +		ud_finish_reboot();
@@ -2309,7 +2517,7 @@ index 0000000..4cddf14
 +		ud_poll_serialized();
 +		polls++;
 +		if ((polls & 0x3ffu) == 0) {
-+			picasso_usb_watchdog_pet();
++			picasso_usb_watchdog_service();
 +		}
 +		if ((polls % 4096) == 0) {
 +			printf("PICASSO USB: poller heartbeat polls=%llu events=%llu rx_busy=%u\n",
@@ -2335,7 +2543,7 @@ index 0000000..4cddf14
 +	for (;;) {
 +		if (ud.live) {
 +			ud_poll_serialized();
-+			picasso_usb_watchdog_pet();
++			picasso_usb_watchdog_service();
 +			if (ud.panic_test && ud.configured && ud.host_open &&
 +			    ++panic_test_polls >= 1000) {
 +				printf("PICASSO CDC: automatic panic-test after host attach\n");
@@ -2344,7 +2552,7 @@ index 0000000..4cddf14
 +			picasso_usb_busy_wait(1000);
 +		} else {
 +			ud_sleep_ms(1000);
-+			picasso_usb_watchdog_pet();
++			picasso_usb_watchdog_service();
 +		}
 +	}
 +}
@@ -2449,6 +2657,7 @@ index 0000000..4cddf14
 +		return;
 +	}
 +	printf("PICASSO USB: hardware guards PASS; issuing controller reset\n");
++	picasso_usb_watchdog_pet();
 +	uint32_t usb2phy = usb_rd(dwc, GUSB2PHYCFG0);
 +	uint32_t usb3pipe = usb_rd(dwc, GUSB3PIPECTL0);
 +	printf("PICASSO USB: pre-stop GCTL=%08x DCFG=%08x DCTL=%08x DSTS=%08x USB2PHYCFG=%08x USB3PIPECTL=%08x\n",
@@ -2487,6 +2696,7 @@ index 0000000..4cddf14
 +	    usb_rd(dwc, GRXFIFOSIZ(0)), usb_rd(dwc, GTXFIFOSIZ(0)),
 +	    usb_rd(dwc, GTXFIFOSIZ(1)), usb_rd(dwc, GTXFIFOSIZ(2)),
 +	    usb_rd(dwc, GTXFIFOSIZ(3)));
++	picasso_usb_watchdog_pet();
 +
 +	qs = dwc + QSCRATCH_OFFSET;
 +	printf("PICASSO USB: QSCRATCH %p (wrapper map %p + 0x%x)\n",
@@ -2502,6 +2712,7 @@ index 0000000..4cddf14
 +	dwc_wr(DCFG, dwc_rd(DCFG) & ~(7u | (0x7fu << 3)));
 +
 +	if (ud_ep0_rebuild("initial") != 0) { return; }
++	picasso_usb_watchdog_pet();
 +
 +	uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL);
 +	uint32_t ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
@@ -2562,7 +2773,7 @@ index 0000000..4cddf14
 +		while ((!ud.configured || !ud.host_open) && handoff_ms < 10000) {
 +			picasso_usb_busy_wait(1000);
 +			ud_poll_serialized();
-+			picasso_usb_watchdog_pet();
++			picasso_usb_watchdog_service();
 +			handoff_ms++;
 +			if (ud.configured &&
 +			    (handoff_ms <= 5 || handoff_ms % 1000 == 0)) {
@@ -2572,6 +2783,7 @@ index 0000000..4cddf14
 +		printf("PICASSO USB: live handoff configured=%u host_open=%u after %u ms\n",
 +		    ud.configured ? 1u : 0u, ud.host_open ? 1u : 0u, handoff_ms);
 +		ud_poll_serialized();
++		picasso_usb_host_ready();
 +		/*
 +		 * Keep the early, synchronous control window open long enough for
 +		 * the host to attach and issue commands. This path runs before the
@@ -2581,16 +2793,94 @@ index 0000000..4cddf14
 +		if (ud.control_ms != 0) {
 +			printf("PICASSO USB: control window open for %u ms\n",
 +			    ud.control_ms);
++			int timer_probe = 0;
++			extern void armcpu_timer_probe_now(void)
++			    __attribute__((weak));
++			if (PE_parse_boot_argn("native-timer-probe", &timer_probe,
++			    sizeof(timer_probe)) && timer_probe) {
++				if (armcpu_timer_probe_now != 0) {
++					armcpu_timer_probe_now();
++				} else {
++					printf("PICASSO TIMER: probe entry point unavailable; continuing\n");
++				}
++			}
++			/*
++			 * M1 stage C: minimal closed loop on INTID 19 (r24 proved it
++			 * is the live line). Begin with DAIF.I set: Group-1 the line,
++			 * enable the GIC path, re-arm the timer. Sample pending masked;
++			 * then unmask briefly and count taken IRQs; re-mask, disable
++			 * the source, report. Every wait iteration pets the watchdog.
++			 */
++			int selftest = 0;
++			extern void armcpu_timer_selftest_begin(void)
++			    __attribute__((weak));
++			extern void armcpu_timer_selftest_sample(unsigned)
++			    __attribute__((weak));
++			extern void armcpu_timer_selftest_go(void)
++			    __attribute__((weak));
++			extern void armcpu_timer_selftest_end(void)
++			    __attribute__((weak));
++			extern void armcpu_timer_sleep_test(void)
++			    __attribute__((weak));
++			if (PE_parse_boot_argn("native-timer-selftest", &selftest,
++			    sizeof(selftest)) && selftest) {
++				if (armcpu_timer_selftest_begin != 0) {
++					armcpu_timer_selftest_begin();
++				} else {
++					printf("PICASSO TIMER: selftest begin unavailable; continuing\n");
++				}
++				for (unsigned w = 0; w < 1500; w++) {
++					picasso_usb_busy_wait(1000);
++					ud_poll_serialized();
++					picasso_usb_watchdog_service();
++					if ((w + 1) % 100 == 0 &&
++					    armcpu_timer_selftest_sample != 0) {
++						armcpu_timer_selftest_sample(w + 1);
++					}
++				}
++				if (armcpu_timer_selftest_go != 0) {
++					armcpu_timer_selftest_go();
++				}
++				for (unsigned w = 0; w < 1500; w++) {
++					picasso_usb_busy_wait(1000);
++					ud_poll_serialized();
++					picasso_usb_watchdog_service();
++					if ((w + 1) % 100 == 0 &&
++					    armcpu_timer_selftest_sample != 0) {
++						armcpu_timer_selftest_sample(w + 1 + 1500);
++					}
++				}
++				if (armcpu_timer_sleep_test != 0) {
++					armcpu_timer_sleep_test();
++				}
++				if (armcpu_timer_selftest_end != 0) {
++					armcpu_timer_selftest_end();
++				}
++				printf("PICASSO TIMER: selftest done\n");
++			}
 +			for (unsigned control_ms = 0;
 +			    control_ms < ud.control_ms; control_ms++) {
++				if (ud.control_deadline != 0 &&
++				    (int64_t)(picasso_usb_counter() - ud.control_deadline) >= 0) {
++					printf("PICASSO USB: control reset deadline reached before poll; returning to Fastboot\n");
++					ud_finish_reboot();
++				}
 +				picasso_usb_busy_wait(1000);
 +				ud_poll_serialized();
-+				picasso_usb_watchdog_pet();
++				picasso_usb_watchdog_service();
++				if (ud.control_reset &&
++				    ((ud.control_deadline != 0 &&
++				    (int64_t)(picasso_usb_counter() - ud.control_deadline) >= 0) ||
++				    control_ms + 1 >= ud.control_reset_ms)) {
++					printf("PICASSO USB: control reset deadline reached; returning to Fastboot\n");
++					ud_finish_reboot();
++				}
 +				if (ud.configured &&
 +				    ((control_ms + 1) % 10000 == 0)) {
 +					printf("PICASSO USB: control window t=%ums events=%llu rx=%llu\n",
 +					    control_ms + 1, ud.events, ud.rx_bytes);
 +				}
++
 +			}
 +			printf("PICASSO USB: control window complete after %u ms\n",
 +			    ud.control_ms);
@@ -2600,7 +2890,7 @@ index 0000000..4cddf14
 +			for (unsigned settle_ms = 0; settle_ms < 500; settle_ms++) {
 +				picasso_usb_busy_wait(1000);
 +				ud_poll_serialized();
-+				picasso_usb_watchdog_pet();
++				picasso_usb_watchdog_service();
 +				if (settle_ms % 100 == 99) {
 +					ud_dump_ep_state("settle", EP_RX);
 +				}
@@ -2608,7 +2898,7 @@ index 0000000..4cddf14
 +		}
 +		if (ud.watchdog_armed) {
 +			printf("PICASSO USB: APSS watchdog retained timeout=%u ms\n",
-+			    APSS_WDT_TIMEOUT_MS);
++			    ud.watchdog_ms);
 +		}
 +		kern_return_t result = kernel_thread_start(ud_thread, NULL, &thread);
 +		if (result == KERN_SUCCESS) {
@@ -2631,7 +2921,12 @@ index 0000000..4cddf14
 +	int panic_test = 0;
 +	int panic_reset = 1;
 +	int watchdog = 1;
++	int watchdog_ms = (int)APSS_WDT_TIMEOUT_MS;
 +	int control_ms = PICASSO_USB_CONTROL_DEFAULT_MS;
++	int control_reset = 0;
++	int control_reset_ms = PICASSO_USB_CONTROL_RESET_DEFAULT_MS;
++	int host_timeout_ms = (int)PICASSO_USB_HOST_TIMEOUT_MS;
++	int host_boot_grace_ms = (int)PICASSO_USB_HOST_BOOT_GRACE_MS;
 +	char reset_mode[16] = "psci";
 +
 +	PE_parse_boot_argn("picasso_usb", &enabled, sizeof(enabled));
@@ -2643,16 +2938,51 @@ index 0000000..4cddf14
 +	    sizeof(panic_reset));
 +	PE_parse_boot_argn("picasso_usb_watchdog", &watchdog,
 +	    sizeof(watchdog));
++	PE_parse_boot_argn("picasso_usb_watchdog_ms", &watchdog_ms,
++	    sizeof(watchdog_ms));
 +	PE_parse_boot_argn("picasso_usb_control_ms", &control_ms,
 +	    sizeof(control_ms));
++	PE_parse_boot_argn("picasso_usb_control_reset", &control_reset,
++	    sizeof(control_reset));
++	PE_parse_boot_argn("picasso_usb_control_reset_ms", &control_reset_ms,
++	    sizeof(control_reset_ms));
++	PE_parse_boot_argn("picasso_usb_host_timeout_ms", &host_timeout_ms,
++	    sizeof(host_timeout_ms));
++	PE_parse_boot_argn("picasso_usb_host_boot_grace_ms", &host_boot_grace_ms,
++	    sizeof(host_boot_grace_ms));
 +	PE_parse_boot_argn("picasso_usb_reset", reset_mode,
 +	    sizeof(reset_mode));
 +	ud.mps = 64;
 +	ud.hold = hold != 0;
 +	ud.control_ms = control_ms > 0 ? (unsigned)control_ms : 0;
++	ud.control_reset = control_reset != 0 && ud.control_ms != 0;
++	if (control_reset_ms <= 0) {
++		control_reset_ms = PICASSO_USB_CONTROL_RESET_DEFAULT_MS;
++	}
++	ud.control_reset_ms = (unsigned)control_reset_ms;
++	if (ud.control_reset && ud.control_reset_ms > ud.control_ms) {
++		ud.control_reset_ms = ud.control_ms;
++	}
 +	ud.panic_test = panic_test != 0;
 +	ud.panic_reset = panic_reset != 0;
 +	ud.watchdog = watchdog != 0;
++	if (watchdog_ms < 1000) {
++		watchdog_ms = (int)APSS_WDT_TIMEOUT_MS;
++	} else if (watchdog_ms > (int)APSS_WDT_MAX_TIMEOUT_MS) {
++		printf("PICASSO USB: watchdog requested_ms=%u exceeds 20-bit hardware; effective_ms=%u (software timeout required for longer waits)\n",
++		    (unsigned)watchdog_ms, APSS_WDT_MAX_TIMEOUT_MS);
++		watchdog_ms = (int)APSS_WDT_MAX_TIMEOUT_MS;
++	}
++	ud.watchdog_ms = (unsigned)watchdog_ms;
++	if (host_timeout_ms < 1000) {
++		host_timeout_ms = (int)PICASSO_USB_HOST_TIMEOUT_MS;
++	}
++	if (host_boot_grace_ms < 1000) {
++		host_boot_grace_ms = (int)PICASSO_USB_HOST_BOOT_GRACE_MS;
++	}
++	ud.host_timeout_ms = (unsigned)host_timeout_ms;
++	ud.host_boot_grace_ms = (unsigned)host_boot_grace_ms;
++	ud.host_seen = false;
 +	if (strcmp(reset_mode, "watchdog") == 0) {
 +		ud.reset_mode = PICASSO_USB_RESET_WATCHDOG;
 +	} else if (strcmp(reset_mode, "pshold") == 0) {
@@ -2669,8 +2999,35 @@ index 0000000..4cddf14
 +	/*
 +	 * Arm before any USB, SMMU or storage work.  If enumeration never
 +	 * succeeds, the absent poller still returns the device to Fastboot.
++	 * The reason must be written now, not only on explicit commands:
++	 * a watchdog bite after enumeration failure has no code left to
++	 * program it, so an unarmed reason drops the board into Android.
 +	 */
++	if (ud.imem != 0) {
++		usb_wr(ud.imem, IMEM_RESTART_REASON, IMEM_FASTBOOT_MODE);
++		uint32_t reason = usb_rd(ud.imem, IMEM_RESTART_REASON);
++		printf("PICASSO USB: Fastboot reason preset readback=0x%08x\n",
++		    reason);
++	}
++	/*
++	 * Start the escape clock before touching GCC, SMMU or DWC3. A later
++	 * enumeration failure must not remove the only path back to Fastboot:
++	 * every bounded wait checks this deadline and resets directly.
++	 */
++	uint64_t frequency = picasso_usb_counter_frequency();
++	if (frequency != 0) {
++		ud.host_deadline = picasso_usb_deadline(ud.host_boot_grace_ms);
++		printf("PICASSO USB: host boot grace armed for %u ms\n",
++		    ud.host_boot_grace_ms);
++		if (ud.control_reset) {
++			ud.control_deadline = picasso_usb_counter() +
++			    frequency * ud.control_reset_ms / 1000u;
++			printf("PICASSO USB: automatic Fastboot return armed for %u ms\n",
++			    ud.control_reset_ms);
++		}
++	}
 +	picasso_usb_watchdog_arm();
++	picasso_usb_watchdog_pet();
 +	if (!ud.watchdog_armed) {
 +		printf("PICASSO USB: watchdog unavailable; autonomous reset disabled\n");
 +	}
@@ -2758,6 +3115,7 @@ index 0000000..4cddf14
 +		}
 +		printf("PICASSO USB: SMMU bind plan PASS slot=%u bank=%u\n",
 +		    plan.slot, plan.bank);
++		picasso_usb_watchdog_pet();
 +		if (plan_only) {
 +			picasso_usb_park(hold);
 +			return;
@@ -2785,6 +3143,7 @@ index 0000000..4cddf14
 +		picasso_usb_park(hold);
 +		return;
 +	}
++	picasso_usb_watchdog_pet();
 +	if (enabled >= 2) {
 +		picasso_usb_gadget_start(dwc, smmu);
 +	} else {
@@ -2948,3 +3307,345 @@ index 7addbb3..de3d6bb 100644
  	    debug_mode_active() || !gCPUsRunning,
  	    "IOLog called with interrupts disabled");
  }
+diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -2791,8 +2791,10 @@
+ 	int                             error = 0;
+ 	kern_return_t                   kr = KERN_SUCCESS;
+ 	struct _sr_file_mappings        *sr_file_mappings = NULL;
+ 	struct vnode                    *rdir_vp = NULL;
+ 	struct vm_shared_region         *shared_region = NULL;
++	printf("PICASSO SR: map enter pid=%d files=%u mappings=%u\n",
++	    proc_getpid(p), files_count, mappings_count);
+ 
+ 	/*
+ 	 * Get a reference to the current proc's root dir.
+@@ -2858,10 +2860,12 @@
+ 	vnode_put(rdir_vp);
+ 	shared_region_map_and_slide_cleanup(p, files_count, sr_file_mappings, shared_region);
+ 
+ 	SHARED_REGION_TRACE_DEBUG(
+ 		("shared_region: %p [%d(%s)] <- map\n",
+ 		(void *)VM_KERNEL_ADDRPERM(current_thread()),
+ 		proc_getpid(p), p->p_comm));
+ 
++	printf("PICASSO SR: map exit pid=%d error=%d kr=0x%x\n",
++	    proc_getpid(p), error, kr);
+ 	return error;
+ }
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7156,3 +7156,179 @@
+ done:
+ 	if (mounted_root) vnode_put(mounted_root);
++	/* r69: file-visibility probe (behavior-neutral diagnostics). */
++	{
++		static const char *paths[] = {
++			"/private/preboot",
++			"/private/preboot/System/Library/Caches/com.apple.dyld",
++			"/private/preboot/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64",
++		};
++		for (unsigned pi = 0; pi < sizeof(paths) / sizeof(paths[0]); pi++) {
++			vnode_t probe_vp = NULLVP;
++			int probe_err = vnode_lookup(paths[pi], 0, &probe_vp, vfs_context_current());
++			if (!probe_err) {
++				struct vnode_attr probe_va;
++				uint64_t probe_size = (uint64_t)-1;
++				VATTR_INIT(&probe_va);
++				VATTR_WANTED(&probe_va, va_data_size);
++				if (!vnode_getattr(probe_vp, &probe_va, vfs_context_current()))
++					probe_size = probe_va.va_data_size;
++				printf("PICASSO CACHE: '%s' err=0 vtype=%d size=%llu fs=%s\n", paths[pi],
++				    vnode_vtype(probe_vp), probe_size,
++				    vnode_mount(probe_vp) ? vfs_statfs(vnode_mount(probe_vp))->f_fstypename : "?");
++				vnode_put(probe_vp);
++			} else {
++				printf("PICASSO CACHE: '%s' err=%d\n", paths[pi], probe_err);
++			}
++		}
++		/* r70: sibling-slice census (single variable vs r69). */
++		{
++			char sib[256];
++			unsigned sib_present = 0;
++			uint64_t sib_total = 0;
++			for (unsigned si = 1; si <= 60; si++) {
++				vnode_t sib_vp = NULLVP;
++				int sib_err;
++				snprintf(sib, sizeof(sib), "%s.%02u",
++				    "/private/preboot/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64", si);
++				sib_err = vnode_lookup(sib, 0, &sib_vp, vfs_context_current());
++				if (!sib_err) {
++					struct vnode_attr sib_va;
++					uint64_t sib_size = (uint64_t)-1;
++					VATTR_INIT(&sib_va);
++					VATTR_WANTED(&sib_va, va_data_size);
++					if (!vnode_getattr(sib_vp, &sib_va, vfs_context_current()))
++						sib_size = sib_va.va_data_size;
++					sib_present++;
++					sib_total += sib_size;
++					printf("PICASSO CACHE: sib %02u size=%llu\n", si, sib_size);
++					vnode_put(sib_vp);
++				} else {
++					printf("PICASSO CACHE: sib %02u err=%d\n", si, sib_err);
++				}
++			}
++			printf("PICASSO CACHE: siblings present=%u total=%llu\n", sib_present, sib_total);
++		}
++		/* r71: root slice header dump + .symbols (single variable vs r70). */
++		{
++			vnode_t hdr_vp = NULLVP;
++			int hdr_err = vnode_lookup("/private/preboot/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64",
++			    0, &hdr_vp, vfs_context_current());
++			printf("PICASSO CACHE: hdr lookup err=%d\n", hdr_err);
++			if (!hdr_err) {
++				char hdr[256];
++				int hdr_resid = 0;
++				int rd_err = vn_rdwr(UIO_READ, hdr_vp, hdr, sizeof(hdr), 0,
++				    UIO_SYSSPACE, IO_NODELOCKED,
++				    vfs_context_ucred(vfs_context_current()),
++				    &hdr_resid, p);
++				printf("PICASSO CACHE: hdr read err=%d\n", rd_err);
++				if (!rd_err) {
++					for (int hl = 0; hl < 16; hl++) {
++						const unsigned char *hb = (const unsigned char *)hdr + hl * 16;
++						printf("PICASSO CACHE: hdr+%03x: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
++						    hl * 16,
++						    hb[0], hb[1], hb[2], hb[3], hb[4], hb[5], hb[6], hb[7],
++						    hb[8], hb[9], hb[10], hb[11], hb[12], hb[13], hb[14], hb[15]);
++					}
++				}
++				vnode_put(hdr_vp);
++			}
++			vnode_t sym_vp = NULLVP;
++			int sym_err = vnode_lookup("/private/preboot/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64.symbols",
++			    0, &sym_vp, vfs_context_current());
++			if (!sym_err) {
++				struct vnode_attr sym_va;
++				uint64_t sym_size = (uint64_t)-1;
++				VATTR_INIT(&sym_va);
++				VATTR_WANTED(&sym_va, va_data_size);
++				if (!vnode_getattr(sym_vp, &sym_va, vfs_context_current()))
++					sym_size = sym_va.va_data_size;
++				printf("PICASSO CACHE: symbols err=0 vtype=%d size=%llu\n",
++				    vnode_vtype(sym_vp), sym_size);
++				vnode_put(sym_vp);
++			} else {
++				printf("PICASSO CACHE: symbols err=%d\n", sym_err);
++			}
++			/* r76: subcache header dump, OOB label fix (single variable vs r75). */
++			{
++				const char *subpaths[2] = {
++					"/private/preboot/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64.29",
++					"/private/preboot/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64.30",
++				};
++				static const char *sublabels[2] = { "29", "30" };
++				for (int si2 = 0; si2 < 2; si2++) {
++					vnode_t svp = NULLVP;
++					int serr = vnode_lookup(subpaths[si2], 0, &svp, vfs_context_current());
++					printf("PICASSO CACHE: sub %s lookup err=%d\n", sublabels[si2], serr);
++					if (!serr) {
++						char sbuf[64];
++						int sresid = 0;
++						int rerr = vn_rdwr(UIO_READ, svp, sbuf, sizeof(sbuf), 0,
++						    UIO_SYSSPACE, IO_NODELOCKED,
++						    vfs_context_ucred(vfs_context_current()),
++						    &sresid, p);
++						printf("PICASSO CACHE: sub %s read err=%d resid=%d\n", sublabels[si2], rerr, sresid);
++						if (!rerr) {
++							for (int sl = 0; sl < 4; sl++) {
++								const unsigned char *sb = (const unsigned char *)sbuf + sl * 16;
++								printf("PICASSO CACHE: sub %s+%02x: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
++								    sublabels[si2], sl * 16,
++								    sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6], sb[7],
++								    sb[8], sb[9], sb[10], sb[11], sb[12], sb[13], sb[14], sb[15]);
++							}
++						}
++						vnode_put(svp);
++					}
++				}
++				/* r77: UFS read size/offset sweep on .31 + special-suffix existence (single variable vs r76). */
++			{
++				vnode_t rvp = NULLVP;
++				static char r77buf[1048576];
++				int rerr0 = vnode_lookup("/private/preboot/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64.31",
++				    0, &rvp, vfs_context_current());
++				printf("PICASSO CACHE: r77 open err=%d\n", rerr0);
++				if (!rerr0) {
++					static const size_t rsizes[] = {4096, 65536, 262144, 1048576};
++					for (int ri = 0; ri < 4; ri++) {
++						int rres = 0;
++						printf("PICASSO CACHE: r77 size=%lu begin\n", (unsigned long)rsizes[ri]);
++						int re = vn_rdwr(UIO_READ, rvp, r77buf, rsizes[ri], 0,
++						    UIO_SYSSPACE, IO_NODELOCKED,
++						    vfs_context_ucred(vfs_context_current()),
++						    &rres, p);
++						printf("PICASSO CACHE: r77 size=%lu end err=%d resid=%d\n", (unsigned long)rsizes[ri], re, rres);
++						if (re)
++							break;
++					}
++					static const off_t roffs[] = {16777216, 33554432, 50331648, 67108864};
++					for (int oi = 0; oi < 4; oi++) {
++						int rres = 0;
++						printf("PICASSO CACHE: r77 off=%ld begin\n", (long)roffs[oi]);
++						int oe = vn_rdwr(UIO_READ, rvp, r77buf, 65536, roffs[oi],
++						    UIO_SYSSPACE, IO_NODELOCKED,
++						    vfs_context_ucred(vfs_context_current()),
++						    &rres, p);
++						printf("PICASSO CACHE: r77 off=%ld end err=%d resid=%d\n", (long)roffs[oi], oe, rres);
++						if (oe)
++							break;
++					}
++					vnode_put(rvp);
++				}
++				{
++					static const char *specs[] = {".33.dylddata", ".34.dyldlinkedit", ".51.dylddata", ".52.dyldlinkedit"};
++					char spath[256];
++					for (int spi = 0; spi < 4; spi++) {
++						vnode_t sp_vp = NULLVP;
++						snprintf(spath, sizeof(spath), "%s%s",
++						    "/private/preboot/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64", specs[spi]);
++						int sperr = vnode_lookup(spath, 0, &sp_vp, vfs_context_current());
++						printf("PICASSO CACHE: r77 special %s err=%d\n", specs[spi], sperr);
++						if (!sperr)
++							vnode_put(sp_vp);
++					}
++				}
++			}
++			}
++		}
++	}
+ 	int root_recheck = root_authorized && native_verified_block_root_authorized(root_device);
+diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
+--- a/bsd/vfs/vfs_lookup.c
++++ b/bsd/vfs/vfs_lookup.c
+@@ -108,9 +108,42 @@
++/* r74: substring match (no strstr in kernel). Catches dirfd-relative */
++/* openat(basename) and directory opens without trailing slash. */
++static int
++native_dyld_cache_match(const char *path)
++{
++	const char *a = "dyld_shared_cache";
++	const char *b = "com.apple.dyld";
++	const char *q, *r;
++	if (path == NULL) {
++		return 0;
++	}
++	for (; *path != '\0'; path++) {
++		if (*path == 'd') {
++			for (q = path, r = a; *r != '\0' && *q == *r; q++, r++) {
++			}
++			if (*r == '\0') {
++				return 1;
++			}
++		} else if (*path == 'c') {
++			for (q = path, r = b; *r != '\0' && *q == *r; q++, r++) {
++			}
++			if (*r == '\0') {
++				return 1;
++			}
++	}
++	}
++	return 0;
++}
++
+ static void
+ native_lookup_note(const char *path, int error)
+ {
+ 	char name[MAXCOMLEN + 1];
+ 	proc_selfname(name, sizeof(name));
++	/* r74: substring match catches dirfd-relative openat(basename). */
++	if (native_dyld_cache_match(path)) {
++		printf("PICASSO NAMEI: err=%d proc=%s path='%s'\n", error, name, path);
++	}
+ 	if (strcmp(name, "MobileSafari") != 0) {
+ 		return;
+ 	}
+ 	char entry[112];
+@@ -286,11 +286,16 @@
+ 	if (error) {
+ 		goto error_out;
+ 	}
+ 	assert(bytes_copied <= MAXPATHLEN);
+ 	ndp->ni_pathlen = (u_int)bytes_copied;
+ 	bytes_copied = 0;
++	/* r74: substring match catches dirfd-relative openat(basename). */
++	if (native_dyld_cache_match(cnp->cn_pnbuf)) {
++		printf("PICASSO NAMEI: enter pid=%d op=%d path='%s'\n",
++		    p ? proc_getpid(p) : -1, cnp->cn_nameiop, cnp->cn_pnbuf);
++	}
+ 
+ 	/*
+ 	 * Since the name cache may contain positive entries of
+ 	 * the incorrect case, force lookup() to bypass the cache
+ 	 * and call directly into the filesystem for each path
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -127,6 +127,16 @@
+ 	uthread->uu_flag |= UT_NOTCANCELPT;
+ 	uthread->syscall_code = code;
+ 
++	/* r78: pid-1 syscall entry tracer: where does dyld stop after .31? */
++	{
++		static int picasso_sc_count = 0;
++		if (proc_pid(proc) == 1 && picasso_sc_count < 1200) {
++			picasso_sc_count++;
++			printf("PICASSO SC: n=%d code=%u arg0=%llu\n", picasso_sc_count,
++			    code, (unsigned long long)uthread->uu_arg[0]);
++		}
++	}
++
+ 	uthread->uu_rval[0] = 0;
+ 
+ 	/*
+
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1333,6 +1333,35 @@
+ 	return (char *)kcdata_iter_payload(iter);
+ }
+ 
++static void
++picasso_service_exit(proc_t p, int rv)
++{
++	static const char * const names[] = {
++		"SpringBoard", "backboardd", "runningboardd", "powerd"
++	};
++	static unsigned counts[4];
++
++	for (unsigned index = 0; index < 4; index++) {
++		if (strncmp(p->p_name, names[index], sizeof(p->p_name))) {
++			continue;
++		}
++		unsigned sample = __atomic_fetch_add(&counts[index], 1,
++		    __ATOMIC_RELAXED);
++		if (sample >= 4) {
++			return;
++		}
++		char description[161] = {0};
++		const char *source = exit_reason_get_string_desc(p->p_exit_reason);
++		if (source != NULL) {
++			snprintf(description, sizeof(description), "%.160s", source);
++		}
++		printf("PICASSO_SERVICE exit sample=%u pid=%d name=%s rv=%x status=%d description=%.160s\n",
++		    sample + 1, proc_getpid(p), names[index], (unsigned)rv,
++		    WEXITSTATUS(rv), description);
++		return;
++	}
++}
++
+ static int initproc_spawned = 0;
+ 
+ static int
+@@ -1885,6 +1914,7 @@
+ void
+ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
+ {
++	picasso_service_exit(p, rv);
+ 	mach_exception_data_type_t code = 0, subcode = 0;
+ 	exception_type_t etype;
+ 

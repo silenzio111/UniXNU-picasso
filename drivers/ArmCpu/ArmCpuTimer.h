@@ -4,15 +4,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// ADT cells are little-endian, unlike Linux FDT cells. Missing keeps the
-// upstream QEMU/sheng default; a malformed property must fail before MMIO.
+// ADT cells are little-endian, unlike Linux FDT cells. Picasso's DTB does not
+// emit the property, so the fallback is its virtual-timer PPI; a malformed
+// property must fail before MMIO.
 static inline bool ArmCpuTimerIntid(const void *property, size_t bytes,
                                    uint32_t *result)
 {
     if (!result) { return false; }
     if (!property) {
         if (bytes) { return false; }
-        *result = 27;
+        *result = 19;
         return true;
     }
     if (bytes != sizeof(uint32_t)) { return false; }

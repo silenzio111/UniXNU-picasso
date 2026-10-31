@@ -9,6 +9,7 @@ struct Sample { uint32_t db, ocs, is; };
 struct FakePort {
   std::vector<Sample> samples;
   unsigned index = 0, reads = 0;
+  void beginPoll(uint32_t) {}
   uint32_t doorbell() { return samples[index].db; }
   uint32_t interrupt() { return samples[index].is; }
   uint32_t completedOcs() {
@@ -55,4 +56,5 @@ int main()
     assert(fatal.reads == 0 && f.interruptSeen == mask); // Fatal wins over OCS=0.
   }
   puts("PASS: unaccepted, delayed, immediate, failed, stuck and fatal UFS completions");
+
 }

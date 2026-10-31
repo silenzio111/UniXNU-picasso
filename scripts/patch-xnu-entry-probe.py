@@ -215,6 +215,17 @@ def assemble_c(source, va, workdir, symbols):
         if not any(base <= text and text + 256 <= base + size for base, size, _, _ in SEGMENTS):
             raise SystemExit('Invalid _boot_progress_panic_text')
         definitions.append(f'-DPANIC_TEXT={text:#x}UL')
+    # CDC mirror for the panic renderer: both panic entries branch into the
+    # renderer directly, bypassing the C panic hooks, so it calls the USB
+    # panic path itself. Missing symbols compile out to 0 (checked before use).
+    for macro, name in (('USB_PANIC_BEGIN', '_picasso_usb_panic_begin'),
+                        ('USB_PANIC_WRITE', '_picasso_usb_panic_write'),
+                        ('USB_PANIC_RESET', '_picasso_usb_panic_reset')):
+        address = symbols.get(name)
+        if address is not None and any(
+                base <= address and address + 8 <= base + size
+                for base, size, _, _ in SEGMENTS):
+            definitions.append(f'-D{macro}={address:#x}UL')
     subprocess.run([clang, '--target=aarch64-none-elf', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',
                     '-mgeneral-regs-only', '-fno-pic', '-mcmodel=tiny', '-Oz', f'-DVINFO={VINFO_VA:#x}UL',
                     *definitions, '-c', source, '-o', obj], check=True)

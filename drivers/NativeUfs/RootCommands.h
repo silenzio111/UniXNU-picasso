@@ -8,6 +8,7 @@
 struct HardwareTransferPort {
   uint64_t deadline;
   uint32_t tracePoll;
+  uint32_t delayUs;
   void beginPoll (uint32_t poll) {
     tracePoll = poll;
     if (poll == 1) NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT poll=begin\n");
@@ -30,7 +31,11 @@ struct HardwareTransferPort {
     return value;
   }
   bool expired () { return mach_absolute_time () >= deadline; }
-  void delay () { IODelay (2); }
+  void delay () {
+    if (delayUs) {
+      IODelay (delayUs);
+    }
+  }
 };
 
 static void putBe32 (uint8_t *at, uint32_t value)
@@ -106,6 +111,9 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
   NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT is_ack=end is=%x\n", read32 (gHost.hc, 0x20));
   HardwareTransferPort port;
   port.tracePoll = 0;
+  port.delayUs = 2;
+  PE_parse_boot_argn ("native-ufs-poll-delay-us", &port.delayUs,
+                      sizeof (port.delayUs));
   clock_interval_to_deadline (timeoutUs, kMicrosecondScale, &port.deadline);
   NATIVE_UFS_TRACE ("NATIVE_UFS_SUBMIT doorbell=begin\n");
   hostWrite (0x58, 1);

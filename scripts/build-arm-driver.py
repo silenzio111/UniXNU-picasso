@@ -42,6 +42,15 @@ def compile_file(source: Path, destination: Path, record: dict, extra_flags: lis
         index += 1
     if is_c:
         command.append('-std=gnu11')
+    # XNU's compile record uses -nostdlibinc but does not carry -isysroot.
+    # Keep the recorded iOS target and add only the host SDK's header search
+    # path, so headers such as Availability.h remain available without
+    # changing the ABI or linking against a macOS sysroot.
+    host_sdk = subprocess.run(
+        ['xcrun', '--sdk', 'macosx', '--show-sdk-path'],
+        capture_output=True, text=True)
+    if host_sdk.returncode == 0 and host_sdk.stdout.strip():
+        command.extend(['-isystem', str(Path(host_sdk.stdout.strip()) / 'usr/include')])
     command.extend(['-Wall', '-Wextra', '-Wno-unused-parameter',
                     '-Wno-c99-designator', '-Wno-reorder-init-list',
                     '-Wno-deprecated-enum-enum-conversion',
@@ -240,10 +249,12 @@ def main():
         'NativeRamBlock': ('native-ram-block', 'NativeRamBlock', 'NativeRamBlock.cpp', [
             '-I', str(ROOT / 'build/storage-abi/include'),
             '-I', str(ROOT / 'drivers/NativeRamBlock'),
+            '-I', str(ROOT / 'build/corecrypto-2023/include'),
         ]),
         'NativeUfs': ('native-ufs', 'NativeUfs', 'NativeUfs.cpp', [
             '-I', str(ROOT / 'build/storage-abi/include'),
             '-I', str(ROOT / 'drivers/NativeUfs'),
+            '-I', str(ROOT / 'build/corecrypto-2023/include'),
             '-I', str(ROOT / 'kits/VerifiedRoot/include'),
             '-DNATIVE_VERIFIED_BLOCK=1',
         ]),

@@ -47,6 +47,7 @@ defconfig = "picasso_defconfig"
 # would be "build-libpthread-kernel.py", "build-arm-driver.py NativeUfs" and
 # "build-arm-driver.py NativeAdreno" appended below.
 archives = [
+  "build-native-aes-bindings.py",
   "build-corecrypto-14.py",
   "build-corecrypto-14.py --namespace",
   "build-arm-driver.py ArmDTPlatform",
@@ -54,6 +55,15 @@ archives = [
   # Stage 6: the UFS controller driver. Its board constants (GccUfs.h) carry
   # the SM7250 physical windows; the ADT ufshc/ufsphy nodes only match classes.
   "build-arm-driver.py NativeUfs",
+  # r84: publish the original ApplePMGRNub before AMFI asks for it. The
+  # prelinked ApplePMGR component is shared with sheng; this archive adds only
+  # the audited lifecycle/publication shim.
+  "build-sheng-platform-power.py",
+  # r63: typed RAM-block backend for the scratch Data seed (DATA_MOUNT).
+  "build-arm-driver.py NativeRamBlock",
+  # The archive is link-only: it removes the class initializer and supplies
+  # guarded reference stubs. It never enters attach, allocation or publish.
+  "build-native-legacy-display.py",
 ]
 
 [kernel.prelink]
@@ -70,12 +80,23 @@ roots = [
   "com.apple.driver.ApplePMGR",
   "com.apple.filesystems.apfs",
   "com.apple.iokit.IOHIDFamily",
+  # Original IOBSD-matched IOSurfaceRoot, required by graphics/media clients.
+  "com.apple.iokit.IOSurface",
+  # M4: the owned NativeLegacyDisplay subclass calls the unchanged
+  # IOMobileFramebufferLegacy implementation by its qualified original
+  # addresses. Keep that parent (and its IOSurface dependency closure) in the
+  # same prelinked layout as the audited candidate before entering runtime.
+  "com.apple.iokit.IOMobileGraphicsFamily",
   "com.apple.iokit.IOStorageFamily",
   "com.apple.kec.Libm",
   "com.apple.kec.corecrypto",
   "com.apple.kec.pthread",
   "com.apple.kext.CoreTrust",
   "com.apple.security.AppleImage4",
+  # r86: launchd's container initialization calls into the real Sandbox
+  # policy. Without this component the MACF lookup returns ENOPOLICY and
+  # sandbox_get_container_expected() aborts pid 1.
+  "com.apple.security.sandbox",
 ]
 
 # Firmware step: build the picasso Mu-Silicium UEFI firmware via unixnu.
@@ -130,9 +151,13 @@ BUILDID_STRING = "picasso-research"
 [payload]
 volume = "PICASSOESP"
 # The embedded 128-KiB-record manifests add about 2.2 MiB to kernel.macho.
-# 55 MiB keeps the payload below the build driver's 95% content threshold
-# while adding only one MiB to the temporary boot image.
-size_mib = 55
+# The 226 MiB carrier with a 128 MiB Data seed faults in ArmCpuDxe before XNU.
+# Keep the proven 128 MiB carrier; larger mutable storage must come from a
+# different backend rather than inflating the early boot ramdisk.
+size_mib = 128
+trust_cache_sha256 = [
+  "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
+]
 loader = "firmware"
 title = "Boot"
 dram_size = "0x80000000"
@@ -155,19 +180,42 @@ kernel_args = [
   # (sheng-pmgr=2 + _sheng_pmgr_run linked). native-ufs-probe=12 runs the
   # SAME startRoot() hardware bring-up from the root-device personality and
   # panics with the full media report (GPT/userdata geometry) after a
-  # short delay -- the stage-6 data we need, without the shim. If AMFI
-  # then panics "No PMGR", the shim port becomes the next task.
+  # r49 (single variable vs r48: probe back on). probe=12 runs startRoot()
+  # bring-up (IODelay polls) from a deferred thread, publishes on success,
+  # panics with the media report only on failure. r48 proved bare start()
+  # rejects everything, so the probe path is the item-3 vehicle.
   "native-ufs-probe=12",
-  # Let bsd_init start the CDC console before the UFS publication diagnostic
-  # runs, so a later UFS panic still has a complete host-side log.
-  "native-ufs-start-delay=5",
+  # r84: AMFI's unchanged bootstrap waits for ApplePMGRNub. Without the
+  # audited provider publication it reaches launchd and panics "AMFI: No PMGR?".
+  "sheng-pmgr=2",
+  # r13: delay UFS root start to 150 s (single variable vs r12). r11/r12 died
+  # r48: start-delay removed (default 5 s deferred start).
   # IOSleep does not reliably make progress this early with cpus=1. The
-  # timebase+yield path has been exercised on hardware; scans also yield at
-  # every 128 KiB batch so CDC keeps draining.
-  "native-ufs-delay-yield=1",
-  # The embedded manifest removes the 9.4 GiB scan, so enable command tracing
-  # for the first hardware qualification of the new bring-up path.
-  "native-ufs-diagnostics=1",
+  # r48: M1 item 3 (single variable vs r47). Hypothesis: the UFS hang was
+  # IODelay-via-WFE with no timer IRQ to wake it; with the timer live,
+  # IODelay(2) polling should progress. 0 restores the production path.
+  "native-ufs-delay-yield=0",
+  # r55 (single variable vs r54): shrink deferred wait 5s->1s so the
+  # blocking deadline falls inside the sleep-test blocking window
+  # (deferred starts ~93ms before sleep iter0; sleep spans ~1.9s).
+  # r54 proved the timer fires (IRQ 833->853) but the 5s deadline lands
+  # ~1.8s into the non-blocking 60s control window where the boot thread
+  # never yields, so no thread is ever scheduled. 1s keeps blocking mode
+  # (delay-yield stays 0) and tests the starvation hypothesis.
+  "native-ufs-start-delay=1",
+  # r19 single-variable vs r15: drop native-ufs-poll-delay-us (restore the
+  # default 2 us IODelay between UFS polls, as in v5 which never set it).
+  # Diagnostics already reverted to 0. If the 38 s death persists,
+  # poll-delay is exonerated and only the kernel build + control/watchdog
+  # magnitudes remain.
+  "native-ufs-diagnostics=0",
+  # Persistent Data is qualified separately; keep the known-good volatile
+  # raw seed path while validating the host-deadman watchdog.
+  "sheng-data-persist=0",
+  # r12: probe removed (single variable vs r11). The read-only snapshot runs
+  # after CDC handoff and touches GICR/SMMU MMIO; r11 died at ~19 s with it,
+  # v5 (no probe) survives. If r12 survives past 19 s, the probe is the
+  # killer and M1 stage A must be reworked, not just lengthened.
   # Diagnostic-only: keep console output flowing when an early kernel path
   # logs with interrupts disabled. Without this XNU panics at
   # serial_console.c:175 before CDC can deliver the surrounding context.
@@ -193,18 +241,98 @@ kernel_args = [
   "picasso_usb_smmu=6",
   # Let the existing background poller service CDC traffic and watchdog pets.
   "picasso_usb_hold=0",
-  # Keep the synchronous CDC command loop open before the timer-dependent
-  # background poller and UFS probe. This is long enough for the host tty to
-  # attach and issue status/reboot-fastboot; everything in this window pets the
-  # watchdog, and the boot continues automatically when it expires.
-  "picasso_usb_control_ms=60000",
+  # r10 showed CDC enumerates ~70 s after boot on the v5 image, so the
+  # earlier 60 s window risked closing before the tty attaches. r11 uses
+  # observation-scale deadlines (deadline family is the single variable vs
+  # r20 deadline family vs r15: restore v5 magnitudes (control 60 s, watchdog
+  # default 15 s) as one family. If the 38 s death persists inside the 60 s
+  # window, the deadline family is exonerated and only the kernel build
+  # remains as the v5-vs-r delta.
+  # r56 (single variable vs r55): control window 60s->180s for more
+  # operating space per user request. Deferred delay stays 1s (deadline
+  # inside sleep-test window), keep=1 unchanged, blocking mode unchanged.
+  # r57 (single variable vs r56): control window 180s->600s for more
+  # operating space per user request (10 min synchronous window).
+  # Deferred delay=1, keep=1, blocking mode unchanged.
+  # r59 (single variable vs r58): control window 120s->30s. User requires
+  # actual wall wait ~= 3 min; at measured ~6.2x dilation 30s nominal ~=
+  # 3.1 min wall. Deferred UFS work (publish seen pre-t=10000 on r58)
+  # fits with wide margin; ticks still land (t=10000/20000/30000).
+  # r58 (single variable vs r57): control window 600s->120s. r57 proved the
+  # window dilates ~6.2x wall (1ms nominal ~= 6.2ms wall), so 600s nominal
+  # ~= 62 min wall and post-window mount evidence stays out of reach in one
+  # attended run. 120s nominal ~= 13 min wall keeps generous operating space
+  # while letting the window end inside a single capture run.
+  # Keep the synchronous control window short; later CDC servicing belongs to
+  # the background poller once the timer path is healthy.
+  "picasso_usb_control_ms=15000",
+  # r14: control reset removed entirely (single variable vs r13). v5 never had
+  # it and survives; r11-r13 (which all died ~19 s) all had it. If the reset
+  # path misfires early, removing it should let the boot pass 19 s. Watchdog
+  # (240 s) remains the backstop; recovery is manual if it does not bite.
   # Arm the APSS watchdog before USB, SMMU and UFS work. If enumeration or a
   # later kernel path hangs, the missing service resets the board back to the
   # Fastboot reason armed in IMEM.
+  # r89 (single variable vs r88): restore the APSS watchdog while keeping the
+  # provider path free of unverified graphics loading. This verifies automatic
+  # recovery on early hangs before graphics is enabled again.
   "picasso_usb_watchdog=1",
-  # The XNU CDC panic/reset path uses PSHOLD as its final fallback and arms the
-  # IMEM Fastboot reason before either panic or command reset.
-  "picasso_usb_reset=pshold",
+  # The APSS counter is 20-bit: 32 s is the hardware maximum. The 60 s host
+  # deadman below keeps petting while the host is alive and then forces a bite.
+  "picasso_usb_watchdog_ms=32000",
+  # Once the CDC host is ready, a parsed command refreshes this deadline.
+  # With no host command for 60 s, the service path stops petting and forces
+  # a Fastboot reset.
+  "picasso_usb_host_timeout_ms=60000",
+  # Before CDC is ready, allow enough time for slow enumeration while still
+  # bounding complete enumeration failure. Once this expires, stop petting
+  # the hardware watchdog and return to Fastboot.
+  "picasso_usb_host_boot_grace_ms=120000",
+  # Petting is host-gated: CDC/host silence stops the service path from
+  # refreshing the watchdog, so an unattended boot returns to Fastboot.
+  # The hardware watchdog bite is the proven Fastboot reset path. IMEM is
+  # preset before the bite; PSHOLD remains the final panic fallback.
+  "picasso_usb_reset=watchdog",
+  # r22 (M1 stage A, single variable vs r21): read-only GIC/timer snapshot
+  # inside the synchronous control window, before the 60 s busy loop. Prints
+  # GICD/GICR/ICC/CNTFRQ/CNTV state + snapshot complete (read-only). No MMIO
+  # writes, no IRQ enable, no timer bring-up.
+  "native-timer-probe=1",
+  # r25 (M1 stage C, single variable vs r24): minimal closed loop on INTID 19
+  # (r24 proved it is the live line). DAIF.I set: Group-1 + enableGic + arm;
+  # sample pending masked; unmask briefly and count IRQs; re-mask, disable
+  # source, report. Replaces stageb2 (same pet'd-loop pattern, ~16 s).
+  "native-timer-selftest=1",
+  # r31: bypass rtclock_intr in the timer IRQ handler (count + EOIR +
+  # manual TVAL re-arm) to prove take/EOIR/re-fire without the early
+  # rtclock hang. Gated in ArmCpu::interrupt, default off.
+  "native-timer-no-rtclock=1",
+  # r52 (single variable vs r51): keep live timer after selftest so the
+  # deferred UFS 5 s blocking wait can wake (r51 post=0 proved End killed it).
+  "native-timer-keep=1",
+  # M2 stage A: after CDC is live, map the GOP framebuffer retained in
+  # PE_Video and paint an eight-bar diagnostic page. Read-only with respect to
+  # storage; no driver or virtual-memory metadata is changed.
+  "picasso-fb-probe=0",
+  # M4 r2: exercise the normal OSKext entry point for the original MobileGraphics
+  # family now that it is prelinked at its audited addresses. No Legacy display
+  # object is allocated or published yet.
+  "offline-mobile-graphics-load=1",
+  # M6: run metaclass registration, allocation, init and release for the owned
+  # Legacy subclass. It is not attached to a nub, published or used for scanout.
+  "offline-legacy-register=1",
+  # CPU/GOP display: use the retained ABL framebuffer as the real legacy
+  # display provider. The original family owns the client/swap lifecycle; the
+  # backend only copies completed BGRA surfaces and releases the text console.
+  "offline-legacy-gop=1",
+  "offline-legacy-pm=1",
+  "offline-legacy-phase=4",
+  "offline-legacy-validate=1",
+  "offline-legacy-transfer=1",
+  "offline-legacy-cpu-present=1",
+  # State queries only for unprotected RAM Data; no keybag or key operations.
+  "picasso-aks-state=1",
+  "sheng-vsync=60",
 ]
 # Stage-5 blind-spot instrumentation (docs/zh/guide/debugging.md 颜色条):
 # scripts/patch-xnu-entry-probe.py (ported from UniXNU-sheng; it adapts itself
@@ -268,11 +396,18 @@ kernel_args = [
 #         is com.apple.kec.pthread (libpthread's kext.xcconfig MODULE_NAME;
 #         "com.apple.kec.libpthread" does not exist and fails the closure);
 #         its pthread_kext_register call fills the function table.
-panic_screen = false
+# r15: enable the panic-screen renderer (single variable vs r14) so the
+# ~38 s death freezes with text instead of resetting silently to Fastboot.
+# Payload flag only; kernel, args, FD, DTB unchanged.
+panic_screen = true
 
 [payload.adt]
 tool = "scripts/make-picasso-adt.py"
 chip_id = "7250"
+# The Data seed is a DBRDISK1 zero-page-packed image. DarwinBoot keeps the
+# packed bytes in the handoff; NativeRamBlock expands only nonzero pages and
+# backs changed pages with the persistent userdata store.
+packed_data_ramdisk = false
 # Select the authenticated OS APFS volume by its published IOMedia UUID. The
 # VerifiedRoot window identity check independently binds this UUID to the
 # owner-signed image before the block device is published.
@@ -293,6 +428,6 @@ root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
 #
 # 256 MiB is DarwinWindowSizeValid()'s minimum (0x10000000..0x200000000 in 2 MiB
 # steps) and fits inside the 252 MiB SYS_MEM run.
-owned_memory_size = "0x10000000"
+owned_memory_size = "0x30000000"
 cpu_regs = "0,0x100,0x200,0x300,0x400,0x500,0x600,0x700"
 unique_chip_id = "required"

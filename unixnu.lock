@@ -9,6 +9,9 @@ commit = "e45fbe30a7879e0b16e26dddb78538f1b00e0bff"
 [source."corecrypto-2023"]
 commit = "11fba65b12d8830630e248dfa8344caf8b065f26"
 
+[source."edk2"]
+commit = "cfb93724a06ff86ff5ba971413368a7809ee42a5"
+
 [source."libdispatch"]
 commit = "30fe6a7d945340ce69cef121132f049e810089a5"
 
