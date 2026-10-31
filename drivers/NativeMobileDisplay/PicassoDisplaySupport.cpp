@@ -28,35 +28,9 @@ static bool initialized, screenReleased;
 static unsigned reportCounts[12][2];
 static IORegistryEntry *displayChosen;
 static bool scaleAdded, rotationAdded;
-static IOService *surfaceRoot;
 
 extern "C" bool native_legacy_display_probe_ready(void) {
     return initialized && (pendingDisplay != nullptr || activeDisplay != nullptr);
-}
-
-static IOService *create_surface_root(void) {
-    if (surfaceRoot) return surfaceRoot;
-    OSObject *object = OSMetaClass::allocClassWithName("IOSurfaceRoot");
-    IOService *root = object ? OSDynamicCast(IOService, object) : nullptr;
-    if (!root) {
-        OSSafeReleaseNULL(object);
-        printf("PICASSO_DISPLAY: IOSurfaceRoot class unavailable\n");
-        return nullptr;
-    }
-    IOService *parent = IOService::getResourceService();
-    bool attached = root->init() && parent && root->attach(parent) &&
-        root->start(parent);
-    printf("PICASSO_DISPLAY: IOSurfaceRoot alloc=%p parent=%p init/attach/start=%u class=%s\n",
-        root, parent, attached ? 1u : 0u,
-        root->getMetaClass() ? root->getMetaClass()->getClassName() : "missing");
-    if (!attached) {
-        if (root->getProvider()) root->detach(parent);
-        root->release();
-        return nullptr;
-    }
-    root->registerService(kIOServiceSynchronous);
-    surfaceRoot = root;
-    return root;
 }
 
 static unsigned takeReport(unsigned *counter) {
@@ -162,8 +136,10 @@ extern "C" bool native_legacy_surface_ready(void) {
     OSSafeReleaseNULL(surface);
     OSSafeReleaseNULL(matching);
     if (!found) {
-        printf("PICASSO_DISPLAY: IOCoreSurfaceRoot missing; creating IOSurfaceRoot\n");
-        (void)create_surface_root();
+        // IOSurfaceRoot matches IOResources only after IOBSD is published. Creating
+        // it here makes a second instance race the normal match and registers the
+        // iosurface sysctl twice (slot 189). Wait again, but never create it.
+        printf("PICASSO_DISPLAY: IOCoreSurfaceRoot unavailable; waiting for normal match\n");
         matching = IOService::nameMatching("IOCoreSurfaceRoot");
         surface = matching ?
             IOService::waitForMatchingService(matching, 5000000000ULL) : nullptr;

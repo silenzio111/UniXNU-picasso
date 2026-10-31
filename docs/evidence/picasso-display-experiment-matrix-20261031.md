@@ -10,7 +10,9 @@
 | H6 | The owned provider can attach and start | `publish-display-start` after registration | Confirmed: GOP `1080x2400`, stride 4320, nub/display attach+start, result 0 | Preserve this path while fixing static initialization |
 | H7 | `postModLoad` can stay if registration is delayed | Ten `status` heartbeats before register | Rejected: same slot 189 panic | Use direct C++ static initialization |
 | H8 | A byte-patched `m16p` kernel can validate the direct initializer | Two-instruction patch in `native_register_display_and_report` | Rejected: modified prebuilt kernel stops before CDC | Do not validate by binary-patching the prelinked kernel |
-| H9 | A current source relink with direct initialization boots to CDC | Direct initializer, no early graphics load | Pending hardware run; current source relink stops before CDC | Compare the source relink against the known-good `m16p` geometry before another device run |
+| H9 | A current source relink with direct initialization boots to CDC | Direct initializer, no early graphics load | Rejected: current source relink still stops before CDC | Keep the known-good m16p kernel while repairing source-build hygiene |
+| H10 | Slot 189 is caused by a manually created `IOSurfaceRoot` | Preserve m16p except for the manual-root creation branch | Confirmed: m20f skips the panic, m20g finds the normal root and publishes the provider | Never create `IOSurfaceRoot`; defer display commands until IOBSD publishes `IOCoreSurfaceRoot` |
+| H11 | The remaining panic is a display regression | Same m20g kernel and display provider | Rejected: OwnerData reaches ENOSPC with 282 free blocks; `watchdogd` then exits and panics | Move to persistent/large Data storage |
 
 ## Known-good baseline
 
