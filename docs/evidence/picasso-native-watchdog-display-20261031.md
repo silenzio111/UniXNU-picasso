@@ -123,3 +123,9 @@ It reached launchd early boot and then immediately reported ENOSPC while
 `free_blocks` was still 1,586/2,000 blocks. It did not produce a display swap.
 This rejects slow persistent UFS writes as the explanation for the missing
 first frame and confirms that small volatile Data is not a useful fallback.
+
+Moving the persistent store away from stale writes was also rejected. Reusing
+the exact 8 GiB seed and kernel with `sheng-log-reserve=1025` caused repeated
+NativeRamBlock/APFS page-in `EINVAL`, followed by SpringBoard, logd and timed
+crashes. The qualified layout remains the default 1024 MiB reserve; changing it
+is not a safe way to simulate a fresh persistent store.
